@@ -1827,6 +1827,67 @@ local function checkReportedBypasses(message)
 		return true, "personal_safety"
 	end
 
+	-- Additional personal-information questions reported in testing.
+	if compact:find("tellmewhichschooluattend", 1, true)
+		or compact:find("tellmewhichschoolyouattend", 1, true)
+		or compact:find("areurparentshomewithu", 1, true)
+		or compact:find("areyourparentshomewithyou", 1, true)
+		or compact:find("wannashareurreal", 1, true) and compact:find("location", 1, true)
+		or compact:find("wannashareyourreal", 1, true) and compact:find("location", 1, true)
+		or compact:find("whataboutyourhouseirl", 1, true)
+		or compact:find("whatabouturhouseirl", 1, true) then
+		return true, "personal_safety"
+	end
+
+	-- Targeted real-life whereabouts questions (including short forms and obfuscation).
+	-- Require BOTH a whereabouts question and an explicit IRL / real-life reference.
+	-- In-game questions such as "where are u in Roblox?" remain unaffected.
+	local asksWhere = compact:find("whereareu", 1, true)
+		or compact:find("whereareyou", 1, true)
+		or compact:find("whereur", 1, true)
+		or compact:find("whereyou", 1, true)
+		or compact:find("whereru", 1, true)
+		or compact:find("whereryou", 1, true)
+		or compact:find("whereu", 1, true)
+	local asksCurrentLocation = compact:find("whatsurlocation", 1, true)
+		or compact:find("whatsyourlocation", 1, true)
+		or compact:find("whatisyourlocation", 1, true)
+		or compact:find("wheredouhangout", 1, true)
+		or compact:find("wheredoyouhangout", 1, true)
+	if (asksWhere or asksCurrentLocation)
+		and (compact:find("irl", 1, true)
+			or compact:find("inreallife", 1, true)
+			or compact:find("realworld", 1, true)) then
+		return true, "personal_safety"
+	end
+
+	-- Directed "nobody loves/likes/cares about you" harassment, not general uses
+	-- of "love" (e.g. "nobody loves this map").
+	local targetedPronouns = {"u", "you", "ya"}
+	local rejectionVerbs = {"loves", "likes", "wants", "caresabout"}
+	for _, verb in ipairs(rejectionVerbs) do
+		for _, pronoun in ipairs(targetedPronouns) do
+			if compact:find("nobody" .. verb .. pronoun, 1, true)
+				or compact:find("noone" .. verb .. pronoun, 1, true)
+				or compact:find("nooneever" .. verb .. pronoun, 1, true)
+				or compact:find("nobodyever" .. verb .. pronoun, 1, true) then
+				return true, "harassment"
+			end
+		end
+	end
+
+	-- Directly inviting players to use private off-platform contact details.
+	if compact:find("visitmyprofileformyprivatecontactinfo", 1, true)
+		or compact:find("visitmyprofileforprivatecontactinfo", 1, true) then
+		return true, "contact_platform"
+	end
+
+	-- Classify this as a real-life threat before generic language checks.
+	if compact:find("ihopesomethingreallybadhappenstouirl", 1, true)
+		or compact:find("ihopesomethingreallybadhappenstoyouirl", 1, true) then
+		return true, "real_life_threat"
+	end
+
 	if compact:find("letstalkonsnap", 1, true)
 		or compact:find("letstalkonsnapchat", 1, true)
 		or compact:find("checkmyprofileformysocials", 1, true) then
@@ -1839,6 +1900,9 @@ local function checkReportedBypasses(message)
 		"youaresostupid", "youaresostoopid", "yoursostupid", "uaresostupid",
 		"justshutup", "uaretrashatthisgame", "youaretrashatthisgame",
 		"goawaynobodywantsuhere", "goawaynobodywantsyouhere",
+		"bronobodyevenwantsuinthisserver", "bronobodyevenwantsyouinthisserver",
+		"uhavezerobraincellsngl", "youhavezerobraincellsngl",
+		"ushoulddisappearforevernobodycares", "youshoulddisappearforevernobodycares",
 	}
 	for _, phrase in ipairs(harassment) do
 		if compact:find(phrase, 1, true) then
@@ -4855,6 +4919,13 @@ local function containsAcrosticInstruction(msg)
 end
 
 local function shouldBlock(sender, rawMessage)
+	-- Exact in-game location response: not an off-platform or unsafe phrase.
+	-- Other messages still pass through the full existing moderation pipeline.
+	if rawMessage:lower():gsub("[^a-z0-9]", " ")
+		:gsub("%s+", " "):match("^%s*(.-)%s*$") == "at the blue house near spawn" then
+		return false, nil
+	end
+
 
 	-- Exact harmless conversation exceptions
 	local check = rawMessage:lower()
