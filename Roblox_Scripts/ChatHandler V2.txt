@@ -1,0 +1,5869 @@
+-- ChatHandler - WITH FULL COMPREHENSIVE SAFETY MODERATION + EMOTE SUPPORT
+-- FIXED v2: Reduced false positives, added missing bypasses
+-- KEY FIXES:
+--   1. SLUR_ROOTS no longer contains ultra-short roots ("nga","nag") that hit normal words
+--   2. "balls" / "lick" / "fuek" / "fuk" variants added to PROFANITY
+--   3. "blue app", "blue application", "greeen app" style Discord color-code bypasses detected
+--   4. "lick my balls", "I clapped so hard last night" caught by phrase detection
+--   5. joined (letters-only) extremism check now requires the FULL word, not a substring,
+--      to prevent "lass" → "ss", "language" → "nga" false matches
+--   6. SS gaming bypass expanded + made safer (no full moderation skip)
+--   7. "normal apps are okay" and similar sentences will no longer false-block
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players          = game:GetService("Players")
+local TextService      = game:GetService("TextService")
+local TextChatService = game:GetService("TextChatService")
+local DataStoreService = game:GetService("DataStoreService")
+
+local function filterMessage(player, message)
+	local result = TextService:FilterStringAsync(message, player.UserId)
+	return result:GetNonChatStringForBroadcastAsync()
+end
+
+-- Create required TextChannel
+local channel = TextChatService:FindFirstChild("RBXGeneral")
+
+if not channel then
+	channel = Instance.new("TextChannel")
+	channel.Name = "RBXGeneral"
+	channel.Parent = TextChatService
+end
+
+local function lockChannel(ch)
+	if ch:IsA("TextChannel") then
+		ch.ShouldDeliverCallback = function() return false end
+	end
+end
+local channelsFolder = TextChatService:WaitForChild("TextChannels", 10)
+if channelsFolder then
+	for _, ch in ipairs(channelsFolder:GetChildren()) do lockChannel(ch) end
+	channelsFolder.ChildAdded:Connect(lockChannel)
+end
+lockChannel(channel)
+
+-- === TARGETED HARD BLOCK (ONLY IMAGE PHRASES) ===
+local HARD_BLOCK_PATTERNS = {
+	"lemme%s*touch%s*em",
+	"i'?m%s*gonna%s*shoot%s*a%s*public%s*place",
+	"shoot%s*a%s*public%s*place",
+	"i%s*(will|ll)%s*put%s*a%s*gun%s*in%s*(ur|your)%s*head",
+	"ill%s*put%s*a%s*gun%s*in%s*(ur|your)%s*head",
+	"touch%s*kids",
+	"touching%s*kids",   -- "I love touching kids"
+	"touche%s*kids",
+	"touchin%s*kids",
+	"love%s*touch%s*kids",
+	"love%s*touching%s*kids",
+	"love%s*killing%s*people",
+	"love%s*killing%s*kids",
+	"love%s*murdering",
+	"love%s*committing%s*crimes",
+	"love%s*committing%s*crime",
+	"enjoy%s*killing%s*people",
+	"like%s*killing%s*people",
+}
+
+-- 🚫 ABSOLUTE HARD BLOCK: NAZI / NEO-NAZI CONTENT
+local HARD_BLOCK_EXTREMIST_TERMS = {
+	"nazi",
+	"nazis",
+	"na zi",
+	"schutzstaffel",
+	"schut zstaffel",
+	"sturmabteilung",
+	"sturmbteilung",
+	"heinrichhimmler",
+	"himmler",
+	"atomwaffendivision",
+	"atomwaffen division",
+	"heil ss",
+	"waffen ss",
+	"ss reich",
+	"diddy",
+	"pdiddy",
+	"seancombs",
+	"epstein",
+	"ebstein",
+	"ebstean",
+	"epsisland",        -- Epstein's island reference
+	"littlesaintjames", -- Epstein's island name
+	"hitler",
+	"swastika",         -- missing from all lists
+	"svastika",
+	"svvastika",
+	"osama",
+	"osamabin",
+	"osamabinladen",
+	"binladen",
+}
+
+-- 🚫 ABSOLUTE HARD BLOCK: SS-STURMBANNFÜHRER (ALL VARIANTS)
+local HARD_BLOCK_EXTREMIST_EXACT = {
+	"ss-sturmbannführer",
+	"ss sturmbannführer",
+	"ss_sturmbannführer",
+	"ssss-sturmbaaaannführer",
+	"ss-sturmbannführer",
+	"sssturmbannfuhrer",
+	"sturmbannfuhrer",
+	-- screenshot bypass: "SS-Strumbanführer" misspelling variants
+	"ssstrumbanfuhrer",
+	"strumbanfuhrer",
+	"ssstrumbannfuhrer",
+	"strumbannfuhrer",
+	"ssstrumfuhrer",
+	"strumfuhrer",
+}
+
+-- 🔒 HARD BLOCK: explicit hate harassment phrases
+local HATE_PHRASES = {
+	"shut%s*up%s*jew",
+	"i%s*hate%s*jews",
+	"i%s*hate%s*jew",
+	"i%s*hope%s*you%s*die",
+	"i%s*hope%s*you%s*die%s*slow",
+	"i%s*hope%s*you%s*burn",
+	"i%s*hope%s*you%s*suffer",
+	"i%s*wish%s*you%s*were%s*dead",
+	"i%s*hope%s*y%w*%s*d%w*",
+	"hope%s*y%w*%s*d%w*",
+	"i%s*wish%s*y%w*%s*dead",
+	"wish%s*y%w*%s*dead",
+	-- heil variants (spaced/partial)
+	"heil%s*na",        -- "Heil Na**" etc
+	"heil%s*nati",
+	"heil%s*national",
+	"heil%s*hit",       -- heil hitl...
+	"heil%s*bit",       -- heil bitler
+	"sieg%s*heil",
+	"sieg%s*hi",
+}
+
+local function normalizeForHardBlock(msg)
+	msg = msg:lower()
+	-- Handle special character substitutions BEFORE stripping
+	msg = msg:gsub("|", "i")    -- sh|t → shit, b|tCH → bitch
+	msg = msg:gsub("§", "s")    -- a§s → ass
+	msg = msg:gsub("@", "a")    -- @ss → ass
+	msg = msg:gsub("0", "o")
+	msg = msg:gsub("1", "i")
+	msg = msg:gsub("3", "e")
+	msg = msg:gsub("4", "a")
+	msg = msg:gsub("5", "s")
+	msg = msg:gsub("7", "t")
+	msg = msg:gsub("!", "i")
+	msg = msg:gsub("%$", "s")
+	-- REMOVE *ALL* NON-LETTERS
+	msg = msg:gsub("[^%a]", " ")
+	msg = msg:gsub("%s+", " ")
+	return msg
+end
+
+local function collapseRuns(s)
+	local out = {}
+	local lastChar = nil
+	for i = 1, #s do
+		local ch = s:sub(i, i)
+		if ch ~= lastChar then
+			table.insert(out, ch)
+			lastChar = ch
+		end
+	end
+	return table.concat(out)
+end
+
+local function containsLetterSubstitutionInstruction(text)
+	local lower = string.lower(text)
+	local hasChangeVerb = lower:find("change", 1, true) or lower:find("turn", 1, true)
+		or lower:find("swap", 1, true) or lower:find("replace", 1, true)
+	local hasConnector = lower:find("into", 1, true) or lower:find(" to ", 1, true)
+		or lower:find("for", 1, true) or lower:find("with", 1, true)
+	if not (hasChangeVerb and hasConnector) then return false end
+	for token in lower:gmatch("%a+") do
+		if #token == 1 then return true end
+	end
+	return false
+end
+
+local PLATFORM_TYPO_WORDS = {
+	"snap","insta","tiktok","discord","whatsapp","telegram","twitch","gmail","skype",
+}
+
+local function editDistance(a, b)
+	local la, lb = #a, #b
+	local d = {}
+	for i = 0, la do d[i] = {[0] = i} end
+	for j = 0, lb do d[0][j] = j end
+	for i = 1, la do
+		for j = 1, lb do
+			local cost = (a:sub(i,i) == b:sub(j,j)) and 0 or 1
+			d[i][j] = math.min(d[i-1][j]+1, d[i][j-1]+1, d[i-1][j-1]+cost)
+		end
+	end
+	return d[la][lb]
+end
+
+local function isPlatformTypo(word)
+	if #word < 4 or #word > 10 then return false, nil end
+	for _, p in ipairs(PLATFORM_TYPO_WORDS) do
+		if #p == #word then
+			for i = 1, #word - 1 do
+				local swapped = word:sub(1,i-1)..word:sub(i+1,i+1)..word:sub(i,i)..word:sub(i+2)
+				if swapped == p then return true, p end
+			end
+		end
+		if math.abs(#p - #word) <= 1 and editDistance(word, p) <= 1 then
+			return true, p
+		end
+	end
+	return false, nil
+end
+
+local function containsDeathWishAdvanced(msg)
+	local text = msg:lower()
+	text = text:gsub("[^a-z0-9]", "")
+	text = text
+		:gsub("0","o")
+		:gsub("1","i")
+		:gsub("3","e")
+		:gsub("4","a")
+		:gsub("5","s")
+		:gsub("7","t")
+	text = collapseRuns(text)
+	if text:find("ihopeyoudie", 1, true) then return true end
+	if text:find("hopeyoudie", 1, true) then return true end
+	if text:find("hopeyou") and text:find("die") then
+		return true
+	end
+	if text:find("iwishyouwere") and text:find("dead") then
+		return true
+	end
+	return false
+end
+
+local function matchesHardBlock(msg)
+	do
+		local norm = string.lower(msg)
+		norm = norm
+			:gsub("@", "a")
+			:gsub("4", "a")
+			:gsub("0", "o")
+			:gsub("1", "i")
+			:gsub("3", "e")
+			:gsub("5", "s")
+		norm = norm
+			:gsub("[/%._%-]+", " ")
+			:gsub("%s+", " ")
+		norm = norm:gsub("[^a-z]", "")
+		for _, term in ipairs(HARD_BLOCK_EXTREMIST_TERMS) do
+			local t = term:gsub("[^a-z]", "")
+			if norm:find(t, 1, true) then
+				return true
+			end
+		end
+	end
+	do
+		local norm = string.lower(msg)
+		norm = norm
+			:gsub("@", "a")
+			:gsub("4", "a")
+			:gsub("0", "o")
+			:gsub("1", "i")
+			:gsub("3", "e")
+			:gsub("5", "s")
+		norm = norm
+			:gsub("[/%._%-]+", " ")
+			:gsub("%s+", " ")
+		norm = norm:gsub("[^a-z]", "")
+		for _, term in ipairs(HARD_BLOCK_EXTREMIST_EXACT) do
+			local t = term:gsub("[^a-z]", "")
+			if norm:find(t, 1, true) then
+				return true
+			end
+		end
+	end
+	local n = " " .. normalizeForHardBlock(msg) .. " "
+	if n:find(" put a gun in ur head ")
+		or n:find(" put a gun in your head ") then
+		if n:find(" i will ")
+			or n:find(" i ll ")
+			or n:find(" ill ") then
+			return true
+		end
+	end
+	for _, pattern in ipairs(HARD_BLOCK_PATTERNS) do
+		if n:find(pattern) then
+			return true
+		end
+	end
+	for _, pattern in ipairs(HATE_PHRASES) do
+		if n:find(pattern) then
+			return true
+		end
+	end
+	return false
+end
+
+--------------------------------------------------------------------
+-- Extremist / hate intent detection (SERVER-SIDE)
+--------------------------------------------------------------------
+
+local PROTECTED_GROUPS = {
+	"jews","jewish",
+	"muslims","islam",
+	"christians","christian",
+	"blacks","black people",
+	"whites","white people",
+	"asians",
+	"mexicans",
+	"gays","gay people","lgbt","trans","transgender",
+}
+
+local function isHateViolence(message)
+	local text = string.lower(message)
+	local joined = text:gsub("[^a-z]", "")
+	local violence = {
+		"kill","gas","exterminate","eradicate","wipeout",
+		"genocide","burn","shoot","hang","lynch",
+	}
+	for _, verb in ipairs(violence) do
+		if joined:find(verb, 1, true) then
+			for _, group in ipairs(PROTECTED_GROUPS) do
+				local g = group:gsub("%s+", "")
+				if joined:find(g, 1, true) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+local EXTREMIST_NAMES = {
+	"hitler",
+	"himmler",
+	"heinrichhimmler",
+	"adolfhitler",
+	"osama",
+	"osamabinladen",
+	"binladen",
+	"stalin",
+	"isis",
+	"isil",
+	"daesh",
+	"nazi",
+	"nazis",
+	"schutzstaffel",
+	"sturmabteilung",
+	"atomwaffendivision",
+}
+
+local EXTREMIST_CALLS = {
+	"joinisis",
+	"supportisis",
+	"heilhitler",
+	"heilbitler",   -- screenshot: "heil bitler" misspelling
+	"heilhitier",
+	"heilhitIer",
+	"heilnazi",
+	"siegheil",
+	"heilnationalsocialism",
+	"heilnationalsocialism",
+	"hailhitler",
+	"hailnazi",
+	"hitlerwasahero",
+	"hitlerwasright",
+	"hitlerwasok",
+	"gasjews",
+	"killmuslims",
+	"heilss",
+	"waffenss",
+}
+
+local EXTREMIST_PEOPLE_STRICT = {
+	"hitler",
+	"adolfhitler",
+	"adolf hitler",
+	"himmler",
+	"heinrichhimmler",
+	"heinrich himmler",
+	-- misspellings used as bypasses
+	"hitIer",  -- capital I instead of l
+	"hitier",
+	"hitlerr",
+	"hiitler",
+	"hittler",
+	-- osama
+	"osama",
+	"osamabinladen",
+	"osamabin",
+}
+
+local EXTREMIST_ORGS_STRICT = {
+	"schutzstaffel", "schutz staffel",
+	"sturmabteilung", "sturm abteilung",
+	-- NOTE: "sa" removed — it's 2 letters and causes massive false positives
+	-- ("i saw", "instagram", "this app", "safe" etc all contain "sa")
+	-- sturmabteilung is already caught above by the full word check
+	"atomwaffendivision", "atomwaffen division",
+	"swastika", "svastika",   -- swastika was completely missing
+}
+
+local EXTREMIST_TERMS_STRICT = {}
+
+local EXTREMIST_SLOGANS_STRICT = {
+	"siegheil", "sieg heil",
+	"heilnazi", "heil nazi",
+	"heilhitler", "heil hitler",
+	"heilbitler", "heil bitler",   -- screenshot bypass
+	"heilhitier", "heil hitier",
+	"hailhitler", "hail hitler",
+	"hailnazi", "hail nazi",
+	"heilnationalsocialism", "heil national socialism",
+	"heilna",  -- "Heil Na**" partial with asterisks
+}
+
+local PRAISE_PATTERNS = {
+	"was right",
+	"was a hero",
+	"did nothing wrong",
+	"we should do",
+	"join",
+	"support",
+	"they were right",
+}
+
+local VIOLENCE_PATTERNS = {
+	"gas",
+	"kill",
+	"exterminate",
+	"wipe out",
+	"genocide",
+}
+
+local function containsAnyPattern(text, patterns)
+	for _, p in ipairs(patterns) do
+		if string.find(text, p, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function sanitizeUnsafeMessage(original)
+	local cleaned = original
+		:gsub("[/%._%-]+", " ")
+		:gsub("%s+", " ")
+		:match("^%s*(.-)%s*$")
+	return cleaned
+end
+
+-- NEW: Detect Morse code / dot-dash spam
+local function looksLikeMorseCode(text)
+	local lower = text:lower()
+	local tokens = {}
+	for token in lower:gmatch("[%.%-]+") do
+		table.insert(tokens, token)
+	end
+	local tokenCount = #tokens
+	local morseCharCount = 0
+	for _, token in ipairs(tokens) do
+		morseCharCount += #token
+	end
+	local hasDot = lower:find("%.")
+	local hasDash = lower:find("%-")
+	if tokenCount >= 3 and hasDot and hasDash then
+		return true
+	end
+	for _, token in ipairs(tokens) do
+		if #token >= 5 then
+			return true
+		end
+	end
+	if tokenCount >= 2 and morseCharCount >= 6 and lower:match("[a-z]") then
+		return true
+	end
+	return false
+end
+
+local function isGayVariant(word)
+	local collapsed = collapseRuns(word)
+	return collapsed == "gay" or collapsed == "gey"
+end
+
+local function isExtremistPraise(message)
+	local cleaned = sanitizeUnsafeMessage(message)
+	local text = string.lower(cleaned)
+	local joined = collapseRuns(text:gsub("[^a-z]", ""))
+	for _, name in ipairs(EXTREMIST_NAMES) do
+		local n = name:gsub("%s+", "")
+		if joined:find(n, 1, true) then
+			for _, p in ipairs(PRAISE_PATTERNS) do
+				if joined:find(p:gsub("%s+", ""), 1, true) then
+					return true
+				end
+			end
+			for _, v in ipairs(VIOLENCE_PATTERNS) do
+				if joined:find(v:gsub("%s+", ""), 1, true) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- RemoteEvent for chat (client uses this)
+local ChatEvent = ReplicatedStorage:FindFirstChild("ChatEvent")
+if not ChatEvent then
+	ChatEvent = Instance.new("RemoteEvent")
+	ChatEvent.Name = "ChatEvent"
+	ChatEvent.Parent = ReplicatedStorage
+end
+
+-- TYPING INDICATOR REMOTE
+local TypingEvent = ReplicatedStorage:FindFirstChild("TypingEvent")
+if not TypingEvent then
+	TypingEvent = Instance.new("RemoteEvent")
+	TypingEvent.Name = "TypingEvent"
+	TypingEvent.Parent = ReplicatedStorage
+end
+
+local typingState = {}
+
+TypingEvent.OnServerEvent:Connect(function(player, isTyping, mode, whisperTarget)
+	if typingState[player] and typingState[player].thread then
+		task.cancel(typingState[player].thread)
+		typingState[player].thread = nil
+	end
+
+	local function getRecipients()
+		local recipients = {}
+		if mode == "whisper" and typeof(whisperTarget) == "Instance" and whisperTarget:IsA("Player") then
+			table.insert(recipients, whisperTarget)
+		elseif mode == "team" then
+			local senderTeam = player.Team
+			if senderTeam then
+				for _, plr in ipairs(Players:GetPlayers()) do
+					if plr ~= player and plr.Team == senderTeam then
+						table.insert(recipients, plr)
+					end
+				end
+			end
+		else
+			for _, plr in ipairs(Players:GetPlayers()) do
+				if plr ~= player then
+					table.insert(recipients, plr)
+				end
+			end
+		end
+		return recipients
+	end
+
+	if isTyping then
+		typingState[player] = { mode = mode, target = whisperTarget }
+		local recipients = getRecipients()
+		for _, plr in ipairs(recipients) do
+			TypingEvent:FireClient(plr, player, true)
+		end
+		typingState[player].thread = task.delay(5, function()
+			for _, plr in ipairs(recipients) do
+				pcall(function() TypingEvent:FireClient(plr, player, false) end)
+			end
+			typingState[player] = nil
+		end)
+	else
+		local state = typingState[player]
+		if state then
+			local recipients = getRecipients()
+			for _, plr in ipairs(recipients) do
+				pcall(function() TypingEvent:FireClient(plr, player, false) end)
+			end
+			typingState[player] = nil
+		end
+	end
+end)
+
+-- RemoteEvent for emotes
+local EmoteEvent = ReplicatedStorage:FindFirstChild("EmoteEvent")
+if not EmoteEvent then
+	EmoteEvent = Instance.new("RemoteEvent")
+	EmoteEvent.Name = "EmoteEvent"
+	EmoteEvent.Parent = ReplicatedStorage
+end
+
+-- Configuration
+local OWNER_USER_ID = 2430602749
+
+-- =====================================================
+-- PERSISTENT MUTE SYSTEM (SERVER-SIDE)
+-- =====================================================
+
+local serverMutes = {}
+
+local MuteEvent = ReplicatedStorage:FindFirstChild("MuteEvent")
+if not MuteEvent then
+	MuteEvent = Instance.new("RemoteEvent")
+	MuteEvent.Name = "MuteEvent"
+	MuteEvent.Parent = ReplicatedStorage
+end
+
+MuteEvent.OnServerEvent:Connect(function(player, action, targetPlayer)
+	if typeof(targetPlayer) ~= "Instance" or not targetPlayer:IsA("Player") then return end
+	if targetPlayer == player then return end
+
+	local muterId = player.UserId
+	local targetId = targetPlayer.UserId
+
+	if action == "mute" then
+		if not serverMutes[muterId] then
+			serverMutes[muterId] = {}
+		end
+		serverMutes[muterId][targetId] = true
+		MuteEvent:FireClient(targetPlayer, "muted_by", player)
+	elseif action == "unmute" then
+		if serverMutes[muterId] then
+			serverMutes[muterId][targetId] = nil
+		end
+		MuteEvent:FireClient(targetPlayer, "unmuted_by", player)
+	end
+end)
+
+local function restoreMuteStateForPlayer(newPlayer)
+	task.wait(2.5)
+	for muterId, muteTable in pairs(serverMutes) do
+		if muteTable[newPlayer.UserId] then
+			local muterPlayer = Players:GetPlayerByUserId(muterId)
+			if muterPlayer then
+				MuteEvent:FireClient(newPlayer, "muted_by", muterPlayer)
+			end
+		end
+	end
+	if serverMutes[newPlayer.UserId] then
+		for mutedId, _ in pairs(serverMutes[newPlayer.UserId]) do
+			local mutedPlayer = Players:GetPlayerByUserId(mutedId)
+			if mutedPlayer then
+				MuteEvent:FireClient(newPlayer, "you_muted", mutedPlayer)
+			end
+		end
+	end
+end
+
+local function notifyExistingPlayersOfRejoin(rejoinedPlayer)
+	task.wait(2.5)
+	for _, existingPlayer in ipairs(Players:GetPlayers()) do
+		if existingPlayer == rejoinedPlayer then continue end
+		if serverMutes[existingPlayer.UserId] and serverMutes[existingPlayer.UserId][rejoinedPlayer.UserId] then
+			MuteEvent:FireClient(existingPlayer, "you_muted", rejoinedPlayer)
+		end
+		if serverMutes[rejoinedPlayer.UserId] and serverMutes[rejoinedPlayer.UserId][existingPlayer.UserId] then
+			MuteEvent:FireClient(existingPlayer, "muted_by", rejoinedPlayer)
+		end
+	end
+end
+
+local TESTER_USER_IDS = {
+	[677069070] = true,
+	[4593829900] = true,
+	[1439750769] = true,
+	[5631831489] = true,
+	[1816411369] = true,
+	[2738148426] = true,
+	[2313922156] = true,
+}
+
+-- =====================================================
+-- OWNER TAG / ROLE SYSTEM
+-- =====================================================
+
+local OwnerTagEvent = ReplicatedStorage:FindFirstChild("OwnerTagEvent")
+if not OwnerTagEvent then
+	OwnerTagEvent = Instance.new("RemoteEvent")
+	OwnerTagEvent.Name = "OwnerTagEvent"
+	OwnerTagEvent.Parent = ReplicatedStorage
+end
+
+local OwnerTagStore = DataStoreService:GetDataStore("SafetyChatOwnerTags_v1")
+
+local ownerTagData = {
+	users = {},
+	disabledDefaults = {}
+}
+
+local function sanitizeTag(tag)
+	tag = tostring(tag or ""):upper()
+	tag = tag:gsub("[^A-Z0-9 _%-]", "")
+	tag = tag:match("^%s*(.-)%s*$") or ""
+	if #tag > 14 then
+		tag = tag:sub(1, 14)
+	end
+	return tag
+end
+
+local function clampColorTable(color)
+	color = type(color) == "table" and color or {}
+
+	return {
+		r = math.clamp(tonumber(color.r) or 255, 0, 255),
+		g = math.clamp(tonumber(color.g) or 255, 0, 255),
+		b = math.clamp(tonumber(color.b) or 255, 0, 255),
+	}
+end
+
+local function makeRole(tag, color)
+	tag = sanitizeTag(tag)
+	if tag == "" then return nil end
+
+	color = type(color) == "table" and color or {}
+
+	return {
+		tag = tag,
+		color = clampColorTable(color),
+		rgb = color.rgb == true
+	}
+end
+
+local function getDefaultTagForUserId(userId)
+	if userId == OWNER_USER_ID then
+		return makeRole("OWNER", {r = 255, g = 210, b = 60})
+	end
+
+	if TESTER_USER_IDS and TESTER_USER_IDS[userId] then
+		return makeRole("TESTER", {r = 100, g = 200, b = 255})
+	end
+
+	return nil
+end
+
+local function getTagForUserId(userId)
+	local key = tostring(userId)
+
+	local custom = ownerTagData.users[key]
+	if custom and custom.tag then
+		return custom
+	end
+
+	if ownerTagData.disabledDefaults and ownerTagData.disabledDefaults[key] then
+		return nil
+	end
+
+	return getDefaultTagForUserId(userId)
+end
+
+local function saveOwnerTags()
+	pcall(function()
+		OwnerTagStore:SetAsync("roles", ownerTagData)
+	end)
+end
+
+local function loadOwnerTags()
+	local ok, data = pcall(function()
+		return OwnerTagStore:GetAsync("roles")
+	end)
+
+	if ok and type(data) == "table" and type(data.users) == "table" then
+		ownerTagData = data
+
+		if type(ownerTagData.disabledDefaults) ~= "table" then
+			ownerTagData.disabledDefaults = {}
+		end
+	else
+		ownerTagData = {
+			users = {},
+			disabledDefaults = {}
+		}
+	end
+end
+
+loadOwnerTags()
+
+local function sendOwnerTagSync(player)
+	if not player then return end
+
+	OwnerTagEvent:FireClient(player, "sync", ownerTagData.users)
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		OwnerTagEvent:FireClient(player, "playerTag", plr.UserId, getTagForUserId(plr.UserId))
+	end
+end
+
+local function broadcastPlayerTag(userId)
+	local role = getTagForUserId(userId)
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		OwnerTagEvent:FireClient(plr, "playerTag", userId, role)
+	end
+end
+
+local function resolveUserId(target)
+	if typeof(target) == "Instance" and target:IsA("Player") then
+		return target.UserId
+	end
+
+	if type(target) == "number" then
+		return target
+	end
+
+	target = tostring(target or ""):match("^%s*(.-)%s*$") or ""
+
+	local asNumber = tonumber(target)
+	if asNumber then
+		return asNumber
+	end
+
+	local plr = Players:FindFirstChild(target)
+	if plr then
+		return plr.UserId
+	end
+
+	local ok, id = pcall(function()
+		return Players:GetUserIdFromNameAsync(target)
+	end)
+
+	if ok and id then
+		return id
+	end
+
+	return nil
+end
+
+local MAX_MESSAGE_LENGTH = 500
+local MAX_EXTREME_LENGTH = 1000
+local BLOCK_TEXT = "Message removed to keep chat safe"
+local WARN_SPAM_TEXT = "Please slow down a little 💬"
+local MUTE_TEXT = "You are temporarily muted for unsafe or spam messages."
+
+local SPAM_COOLDOWN = 1.2
+local SPAM_WINDOW_SECONDS = 8
+local SPAM_MAX_IN_WINDOW = 7
+local REPEAT_MESSAGE_LIMIT = 2
+local REPEAT_MESSAGE_MUTE_LIMIT = 4
+local MUTE_THRESHOLD = 5
+local MUTE_DURATION = 120
+
+local STICKER_COOLDOWN = 20
+local lastStickerTime = {}
+local stickerCooldowns = {}
+
+local MODERATION_LOG_ENABLED = true
+local function logModeration(player, message, reason, action)
+	if MODERATION_LOG_ENABLED then
+		local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+		print(string.format("[MODERATION] %s | Player: %s (%d) | Reason: %s | Action: %s | Message: %s", 
+			timestamp, player.Name, player.UserId, reason, action, message:sub(1, 100)))
+	end
+end
+
+local lastMessageTime = {}
+local messageHistory  = {}
+local blockedHistory  = {}
+local muteUntil       = {}
+local spamState       = {}
+
+local function normalizeSpamMessage(text)
+	text = tostring(text or ""):lower()
+	text = text:gsub("[^a-z0-9]", "")
+	text = text:gsub("%s+", "")
+	return text
+end
+
+--------------------------------------------------------
+-- EMOTE HANDLING
+--------------------------------------------------------
+
+local VALID_EMOTES = {
+	["dance"] = true, ["wave"] = true, ["cheer"] = true, ["laugh"] = true,
+	["point"] = true, ["shrug"] = true, ["applaud"] = true, ["tilt"] = true,
+	["hello"] = true, ["dance1"] = true, ["dance2"] = true, ["dance3"] = true,
+	["sit"] = true, ["salute"] = true, ["bow"] = true, ["clap"] = true,
+	["nod"] = true, ["shake"] = true, ["floss"] = true, ["gangnam"] = true,
+	["zen"] = true, ["ninja"] = true, ["magic"] = true, ["karate"] = true,
+	["sneak"] = true, ["zombie"] = true, ["robot"] = true, ["vampire"] = true,
+	["werewolf"] = true, ["superhero"] = true,
+}
+
+local function isValidEmote(emoteName)
+	if not emoteName then return false end
+	return VALID_EMOTES[string.lower(emoteName)] == true
+end
+
+local function handleEmoteCommand(player, message)
+	local emoteMatch = message:match("^/e%s+(%w+)") or message:match("^/e(%w+)")
+	if emoteMatch and isValidEmote(emoteMatch) then
+		EmoteEvent:FireClient(player, string.lower(emoteMatch))
+		return true
+	end
+	return false
+end
+
+--------------------------------------------------------
+-- TEXT NORMALISATION HELPERS
+--------------------------------------------------------
+local function makeFuzzy(msg)
+	local lower = string.lower(msg)
+	-- Special character substitutions (bypass attempts like sh|t, a§s, b|tCH)
+	lower = lower
+		:gsub("|", "i")   -- sh|t, b|tch
+		:gsub("§", "s")   -- a§s
+		:gsub("%$", "s")   -- $hit
+		:gsub("!", "i")   -- b!tch
+		:gsub("¡", "i")
+		:gsub("@", "a")   -- @ss
+		:gsub("£", "e")
+		:gsub("¥", "y")
+		:gsub("€", "e")
+		:gsub("ø", "o")
+		:gsub("ð", "d")
+		:gsub("þ", "th")
+		:gsub("0", "o")
+		:gsub("1", "i")
+		:gsub("3", "e")
+		:gsub("4", "a")
+		:gsub("5", "s")
+		:gsub("7", "t")
+	local normalized = lower
+		:gsub("à", "a"):gsub("á", "a"):gsub("â", "a"):gsub("ã", "a"):gsub("ä", "a"):gsub("å", "a")
+		:gsub("è", "e"):gsub("é", "e"):gsub("ê", "e"):gsub("ë", "e")
+		:gsub("ì", "i"):gsub("í", "i"):gsub("î", "i"):gsub("ï", "i")
+		:gsub("ò", "o"):gsub("ó", "o"):gsub("ô", "o"):gsub("õ", "o"):gsub("ö", "o")
+		:gsub("ù", "u"):gsub("ú", "u"):gsub("û", "u"):gsub("ü", "u")
+		:gsub("ý", "y"):gsub("ÿ", "y")
+		:gsub("ñ", "n"):gsub("ç", "c")
+	local norm  = normalized:gsub("[^%w]", "")
+	local fuzzy = collapseRuns(norm)
+	return lower, norm, fuzzy
+end
+
+local function removeAllNonLetters(text)
+	return string.lower(text):gsub("[^%a]", "")
+end
+
+local function normalizeForSafePhrase(text)
+	local normalized = string.lower(text)
+	normalized = normalized:match("^%s*(.-)%s*$") or normalized
+	normalized = normalized:gsub("%s+", " ")
+	return normalized
+end
+
+local function normalizeForDatingCheck(text)
+	local lower = string.lower(text)
+	local normalized = lower:gsub("[^%w]", " ")
+	normalized = normalized:gsub("%s+", " ")
+	normalized = normalized:match("^%s*(.-)%s*$") or normalized
+	return normalized
+end
+
+local function escapePattern(s)
+	return s:gsub("[%(%)%.%+%-%*%?%[%]%^%$%%]", "%%%0")
+end
+
+local function containsAny(hay, list)
+	for _, word in ipairs(list) do
+		local e = escapePattern(word)
+		if hay:match("%f[%a]" .. e .. "%f[%A]")
+			or hay:match("^" .. e .. "%f[%A]")
+			or hay:match("%f[%a]" .. e .. "$")
+			or hay == word then
+			return true, word
+		end
+	end
+	return false, nil
+end
+
+local FREE_SAFE_WORDS = {
+	["freeze"] = true,
+	["freezing"] = true,
+	["frozen"] = true,
+}
+
+local ROBUX_VARIANTS = {
+	"robux","robuxx","r0bux","rbux","rbx",
+	"bobux","boobux","bubux","robox",
+	"robucks","robuck","r0bucks","rbucks",
+	"robuxks","robuxes","robuxxx",
+}
+
+local function containsFreeRobuxScam(lower, fuzzy)
+	local joined = lower:gsub("[^a-z]", "")
+	local hasFree =
+		lower:match("%f[%a]free%f[%A]")
+		and not FREE_SAFE_WORDS[lower]
+		and not lower:match("%f[%a]free%a+")
+	if not hasFree then
+		return false
+	end
+	for _, word in ipairs(ROBUX_VARIANTS) do
+		if lower:find(word, 1, true)
+			or fuzzy:find(word, 1, true)
+			or joined:find(word, 1, true) then
+			return true
+		end
+	end
+	if joined:find("bloxdrope", 1, true)
+		or joined:find("bloxdrop", 1, true) then
+		return true
+	end
+	return false
+end
+
+local function matchesWholePhrase(text, pattern)
+	local escaped = pattern:gsub("[%(%)%.%+%-%*%?%[%]%^%$%%]", "%%%0")
+	local pattern1 = "%f[%W]" .. escaped .. "%f[%W]"
+	local pattern2 = "^" .. escaped .. "%f[%W]"
+	local pattern3 = "%f[%W]" .. escaped .. "$"
+	local pattern4 = "^" .. escaped .. "$"
+	return text:match(pattern1) ~= nil or text:match(pattern2) ~= nil
+		or text:match(pattern3) ~= nil or text:match(pattern4) ~= nil
+end
+
+local function containsSpacedStandaloneWord(lower, word)
+	local parts = {}
+	for i = 1, #word do
+		table.insert(parts, word:sub(i, i))
+	end
+	local pattern = "%f[%a]" .. table.concat(parts, "[%s%p]*") .. "%f[%A]"
+	return lower:find(pattern) ~= nil
+end
+
+local function containsSafePhrasePattern(text)
+	local normalized = normalizeForSafePhrase(text)
+	local safePatterns = {
+		{"hope", "ur", "feeling", "great"}, {"hope", "u", "feeling", "great"},
+		{"hope", "you", "feeling", "great"}, {"hope", "your", "feeling", "great"},
+		{"how", "u", "feeling"}, {"how", "ur", "feeling"}, {"how", "you", "feeling"},
+		{"how", "your", "feeling"}, {"how", "are", "u", "feeling"}, {"how", "are", "you", "feeling"},
+		{"how", "are", "u", "doing"}, {"how", "are", "you", "doing"},
+		{"hope", "ur", "doing", "great"}, {"hope", "u", "doing", "great"}, {"hope", "you", "doing", "great"},
+		{"hello", "how", "are", "u"}, {"hello", "how", "are", "you"},
+		{"what", "game", "did", "u", "play"}, {"what", "game", "did", "you", "play"},
+		{"i", "wanna", "know"}, {"i", "want", "to", "know"},
+		{"i", "love", "u"}, {"i", "love", "you"}, {"i", "love", "ur"}, {"i", "love", "your"},
+		{"love", "u"}, {"love", "you"},
+		{"i", "am", "good"}, {"i", "m", "good"}, {"im", "good"}, {"i'm", "good"},
+		{"i", "am", "fine"}, {"i", "m", "fine"}, {"im", "fine"}, {"i'm", "fine"},
+		{"i", "am", "okay"}, {"i", "m", "okay"}, {"im", "okay"}, {"i'm", "okay"},
+		{"i", "am", "ok"}, {"i", "m", "ok"}, {"im", "ok"}, {"i'm", "ok"},
+		{"i", "am", "great"}, {"i", "m", "great"}, {"im", "great"}, {"i'm", "great"},
+		{"i", "am", "well"}, {"i", "m", "well"}, {"im", "well"}, {"i'm", "well"},
+		{"i", "am", "alright"}, {"i", "m", "alright"}, {"im", "alright"}, {"i'm", "alright"},
+		{"i", "am", "doing", "good"}, {"i", "m", "doing", "good"}, {"im", "doing", "good"}, {"i'm", "doing", "good"},
+		{"i", "am", "doing", "fine"}, {"i", "m", "doing", "fine"}, {"im", "doing", "fine"}, {"i'm", "doing", "fine"},
+		{"i", "am", "doing", "well"}, {"i", "m", "doing", "well"}, {"im", "doing", "well"}, {"i'm", "doing", "well"},
+		{"thanks", "for", "asking"}, {"thank", "you", "for", "asking"}, {"thx", "for", "asking"},
+	}
+	if text:find("<3") or text:find("❤") or text:find("💕") or text:find("💖") or text:find("💗") then
+		local heartPattern = text:gsub("[^%w%<%3❤💕💖💗]", " "):gsub("%s+", " ")
+		if heartPattern:find("i") and (heartPattern:find("<3") or heartPattern:find("❤") or heartPattern:find("💕") or heartPattern:find("💖") or heartPattern:find("💗")) and (heartPattern:find("u") or heartPattern:find("you")) then
+			return true
+		end
+	end
+	local textForMatching = normalized:gsub("[%p]", " ")
+	textForMatching = textForMatching:gsub("%s+", " ")
+	local words = {}
+	for word in textForMatching:gmatch("%S+") do
+		table.insert(words, word)
+	end
+	for _, pattern in ipairs(safePatterns) do
+		for i = 1, #words - #pattern + 1 do
+			local match = true
+			for j = 1, #pattern do
+				if words[i + j - 1] ~= pattern[j] then
+					match = false
+					break
+				end
+			end
+			if match then return true end
+		end
+	end
+	local textClean = normalized:gsub("[%p]", " "):gsub("%s+", " ")
+	for _, pattern in ipairs(safePatterns) do
+		local patternClean = table.concat(pattern, " ")
+		if textClean:find(patternClean, 1, true) then return true end
+	end
+	return false
+end
+
+local function looksLikeNormalConversation(text, lower, messageLength)
+	if messageLength > 50 then
+		local commonWords = {
+			"hello", "hi", "hey", "how", "are", "you", "u", "ur", "doing", "hope",
+			"great", "good", "nice", "what", "game", "play", "did", "last", "time",
+			"bro", "wanna", "want", "know", "thanks", "thank", "yes", "no", "ok", "okay",
+			"cool", "awesome", "nice", "yeah", "yep", "sure", "maybe", "probably",
+			"really", "actually", "think", "feel", "like", "love", "hate", "enjoy",
+			"fun", "boring", "interesting", "amazing", "wow", "lol", "haha", "lmao",
+			"chat", "working", "work", "works", "worked", "so", "far", "the", "is", "this",
+			"that", "these", "those", "very", "much", "more", "most", "some", "any",
+		}
+		local wordCount = 0
+		for _, word in ipairs(commonWords) do
+			if lower:find("%f[%w]" .. word .. "%f[%W]") then wordCount = wordCount + 1 end
+		end
+		if wordCount >= 3 then return true end
+		local hasSpaces = text:find("%s")
+		local hasNormalWords = lower:match("[a-z]+") ~= nil
+		local hasMultipleWords = #lower:gsub("[^%s]", "") >= 2
+		if hasSpaces and hasNormalWords and hasMultipleWords then return true end
+	end
+	return false
+end
+
+local function containsRealNameQuestion(lower, fuzzy, nospace)
+	lower = lower:gsub("'", "'")
+	local patterns = {
+		"what's your real name",
+		"what is your real name",
+		"whats your real name",
+		"what's ur real name",
+		"what is ur real name",
+		"whats ur real name",
+		"ur real name",
+		"your real name",
+	}
+	for _, p in ipairs(patterns) do
+		if lower:find(p, 1, true) then
+			return true
+		end
+	end
+	if nospace:find("whatsyourrealname", 1, true)
+		or nospace:find("whatisyourrealname", 1, true)
+		or nospace:find("whatsurrealname", 1, true)
+		or nospace:find("whatisurrealname", 1, true) then
+		return true
+	end
+	if fuzzy:find("whatsyourrealname", 1, true)
+		or fuzzy:find("whatsurrealname", 1, true) then
+		return true
+	end
+	return false
+end
+
+local function containsRealNameQuestionAdvanced(lower, lettersOnly)
+	local collapsed = collapseRuns(lettersOnly)
+	if not (
+		collapsed:find("what", 1, true)
+			or collapsed:find("wat", 1, true)
+			or collapsed:find("wats", 1, true)
+		) then
+		return false
+	end
+	if not (collapsed:find("your", 1, true) or collapsed:find("ur", 1, true)) then
+		return false
+	end
+	if not (collapsed:find("real", 1, true) or collapsed:find("rl", 1, true)) then
+		return false
+	end
+	if not collapsed:find("name", 1, true) then
+		return false
+	end
+	return true
+end
+
+local function isNormalConversationalSentence(text, lower, trimmed)
+	local directPhrases = {
+		"the chat is doing great so far",
+		"so far the chat is doing great",
+		"the chat is doing great",
+		"chat is doing great so far",
+		"so far the chat is working great",
+		"the chat is working great",
+		"chat is working great",
+		"the chat is working",
+		"chat is working",
+		"this is working great",
+		"that is working great",
+		"it is working great",
+		"everything is working great",
+		"i cant chat",
+		"i can't chat",
+		"i cannot chat",
+		"cant chat",
+		"can't chat",
+		"cannot chat",
+		"so players know i cant chat",
+		"so players know i can't chat",
+		"so players know i cannot chat",
+		"team chat works too",
+		"it blocks bad things",
+		"can't see ur messages",
+		"cant see ur messages",
+		"can't see your messages",
+		"cant see your messages",
+		"see ur messages",
+		"see your messages",
+		"made this chat for players",
+		"made this chat for player safety",
+		"chat for players safety",
+		"players to chat freely",
+		"to chat freely",
+		"horrible roblox update",
+		"roblox update",
+		"has a cooldown",
+		"cooldown of",
+		"sec cooldown",
+		"second cooldown",
+		-- FIX: Add "normal apps" style phrases
+		"normal apps",
+		"normal app",
+		"apps are okay",
+		"apps are fine",
+		"apps are allowed",
+		"apps are good",
+	}
+
+	if lower:match("^i[%s']*m%s+playing%s+") then
+		return true
+	end
+	if lower:match("^why%s+would%s+we%s+") then
+		return true
+	end
+	for _, phrase in ipairs(directPhrases) do
+		if lower:find(phrase, 1, true) then
+			return true
+		end
+	end
+
+	local conversationalPatterns = {
+		{"so", "far", "the", "chat", "is", "working", "great"},
+		{"so", "far", "the", "chat", "is", "working"},
+		{"so", "far", "the", "chat", "is", "doing", "great"},
+		{"so", "far", "the", "chat", "is", "doing"},
+		{"the", "chat", "is", "doing", "great", "so", "far"},
+		{"the", "chat", "is", "doing", "great"},
+		{"the", "chat", "is", "doing"},
+		{"so", "far", "so", "good"},
+		{"the", "chat", "is", "working"},
+		{"the", "chat", "is", "working", "great"},
+		{"chat", "is", "working"},
+		{"chat", "is", "working", "great"},
+		{"chat", "is", "doing", "great"},
+		{"this", "is", "working"},
+		{"this", "is", "working", "great"},
+		{"this", "is", "doing", "great"},
+		{"that", "is", "working"},
+		{"that", "is", "working", "great"},
+		{"that", "is", "doing", "great"},
+		{"its", "working"},
+		{"it's", "working"},
+		{"it", "is", "working"},
+		{"its", "working", "great"},
+		{"it's", "working", "great"},
+		{"it", "is", "working", "great"},
+		{"its", "doing", "great"},
+		{"it's", "doing", "great"},
+		{"it", "is", "doing", "great"},
+		{"everything", "is", "working"},
+		{"everything", "is", "working", "great"},
+		{"everything", "is", "doing", "great"},
+		{"so", "far"},
+		{"so", "far", "so", "good"},
+		{"working", "great"},
+		{"doing", "great"},
+		{"chat", "works"},
+		{"this", "works"},
+		{"that", "works"},
+	}
+
+	local normalized = lower:gsub("[%p]", " "):gsub("%s+", " ")
+	local words = {}
+	for word in normalized:gmatch("%S+") do
+		table.insert(words, word)
+	end
+
+	for _, pattern in ipairs(conversationalPatterns) do
+		for i = 1, #words - #pattern + 1 do
+			local match = true
+			for j = 1, #pattern do
+				if words[i + j - 1] ~= pattern[j] then
+					match = false
+					break
+				end
+			end
+			if match then return true end
+		end
+	end
+
+	for _, pattern in ipairs(conversationalPatterns) do
+		local patternIdx = 1
+		for i = 1, #words do
+			if words[i] == pattern[patternIdx] then
+				patternIdx = patternIdx + 1
+				if patternIdx > #pattern then
+					return true
+				end
+			end
+		end
+	end
+
+	local conversationalWords = {"chat", "working", "work", "works", "doing", "great", "good", "so", "far", "the", "is", "this", "that", "well", "nice", "cool", "awesome", "amazing", "wonderful", "perfect", "excellent"}
+	local foundWords = 0
+	for _, word in ipairs(conversationalWords) do
+		if matchesWholePhrase(lower, word) then
+			foundWords = foundWords + 1
+		end
+	end
+
+	local hasChat = matchesWholePhrase(lower, "chat")
+	local hasDoing = matchesWholePhrase(lower, "doing")
+	local hasGreat = matchesWholePhrase(lower, "great")
+	local hasSo = matchesWholePhrase(lower, "so")
+	local hasFar = matchesWholePhrase(lower, "far")
+	if hasChat and hasDoing and hasGreat and hasSo and hasFar then
+		local hasBlockedWord = false
+		for _, blocked in ipairs({"nga", "deadass", "cornball"}) do
+			if lower:find(blocked, 1, true) then
+				hasBlockedWord = true
+				break
+			end
+		end
+		if not hasBlockedWord then
+			return true
+		end
+	end
+
+	if foundWords >= 2 and #words >= 3 and #words <= 25 then
+		local hasBlockedWord = false
+		for _, blocked in ipairs({"nga", "deadass", "cornball"}) do
+			if lower:find(blocked, 1, true) then
+				hasBlockedWord = true
+				break
+			end
+		end
+		if not hasBlockedWord then
+			return true
+		end
+	end
+
+	local structureWords = {"the", "is", "are", "was", "were", "this", "that", "these", "those", "so", "very", "really", "quite"}
+	local structureCount = 0
+	for _, word in ipairs(structureWords) do
+		if matchesWholePhrase(lower, word) then
+			structureCount = structureCount + 1
+		end
+	end
+
+	if structureCount >= 1 and foundWords >= 1 and #words >= 4 and #words <= 25 then
+		local hasBlockedWord = false
+		for _, blocked in ipairs({"nga", "deadass", "cornball"}) do
+			if lower:find(blocked, 1, true) then
+				hasBlockedWord = true
+				break
+			end
+		end
+		if not hasBlockedWord then
+			return true
+		end
+	end
+
+	if lower:find("cant chat", 1, true)
+		or lower:find("can't chat", 1, true)
+		or lower:find("cannot chat", 1, true) then
+		return true
+	end
+
+	return false
+end
+
+local ALLOWED_EMOJIS = {
+	["😂"] = true, ["💀"] = true, ["😭"] = true, ["🔥"] = true, ["🗿"] = true,
+	["😈"] = true, ["💯"] = true, ["🥶"] = true, ["😱"] = true, ["👍"] = true,
+	["✅"] = true, ["❌"] = true, ["❗"] = true, ["❓"] = true,
+}
+
+local function isEnglishOnly(raw)
+	for _, code in utf8.codes(raw) do
+		if code >= 32 and code <= 126 then
+			-- normal ASCII text, always fine
+		else
+			-- any non-ASCII character just needs to be on the whitelist,
+			-- regardless of which emoji block it falls in
+			local char = utf8.char(code)
+			if not ALLOWED_EMOJIS[char] then
+				return false
+			end
+		end
+	end
+	return true
+end
+
+local function isCommonGreetingVariation(text, lower, trimmed)
+	local greetingPatterns = {
+		"^h+i+$", "^h+e+l+l+o+$", "^h+e+y+$", "^h+i+i+$", "^h+e+l+l+o+o+$",
+		"^h+e+l+l+o+o+o+$", "^h+e+l+l+o+o+o+o+$", "^h+i+i+i+$", "^h+i+i+i+i+$",
+		"^h+i+i+i+i+i+$", "^h+e+y+y+$", "^h+e+y+y+y+$",
+	}
+	for _, pattern in ipairs(greetingPatterns) do
+		if trimmed:match(pattern) then
+			return true
+		end
+	end
+	local greetingStarts = {"hi", "hey", "hello", "hii", "heyy", "helloo", "hiii", "heyyy", "hellooo"}
+	for _, greeting in ipairs(greetingStarts) do
+		if trimmed:match("^" .. greeting) and #trimmed <= #greeting + 5 then
+			return true
+		end
+	end
+	return false
+end
+
+local function hasExcessiveRepeats(text)
+	local lower = string.lower(text)
+	local trimmed = lower:match("^%s*(.-)%s*$") or lower
+	if isCommonGreetingVariation(text, lower, trimmed) then
+		return false
+	end
+	local maxRepeat = 0
+	local currentChar = nil
+	local currentCount = 0
+	for i = 1, #text do
+		local ch = text:sub(i, i)
+		if ch == currentChar then
+			currentCount += 1
+		else
+			if currentCount > maxRepeat then maxRepeat = currentCount end
+			currentChar = ch
+			currentCount = 1
+		end
+	end
+	if currentCount > maxRepeat then maxRepeat = currentCount end
+	return maxRepeat > 7
+end
+
+local function isContentCreationPhrase(lower)
+	local phrases = {
+		"im recording", "i'm recording", "im rec", "i'm rec",
+		"im making a video", "i'm making a video", "making a video",
+		"im creating a video", "i'm creating a video", "creating a video",
+		"recording a video", "recording rn", "im filming", "i'm filming", "filming a video",
+	}
+	for _, p in ipairs(phrases) do
+		if lower:find(p, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+--------------------------------------------------------
+-- WORD LISTS
+--------------------------------------------------------
+
+local EXPLICIT_SLURS = {
+	"chingchong","ching chong","ching-chong",
+	"neger","neeger","neeeger","negerr",
+	"raghead","rag head","rag-head",
+	"sambo","samb0","saambo",
+	"skooty","skuty","skoooty",
+	"yamyam","yam yam","yam-yam",
+	"ikey","iky","ikeymo",
+	-- racial slur from screenshot
+	"blax",
+	-- anti-semitic slurs
+	"kike","kyke","kik","ky ke",
+	"jewboy","jewboi",
+	-- Additional racial slurs
+	"spic","spick","wetback","wetbak",
+	"gook","g00k","ch1nk","chink",
+	"towelhead","towel head",
+	"camel jockey","cameljockey",
+	"zipperhead","ziperhead",
+}
+
+local ANATOMY_STANDALONE = {
+	["penis"] = true,
+	["vagina"] = true,
+	["testicles"] = true,
+	["boobs"] = true,
+	["breasts"] = true,
+	["genitals"] = true,
+	["dildo"] = true,
+}
+
+local SEXUAL_ROOTS = {
+	"porn","porm","prn",
+	"sem","semen",
+	"porno","sex","sexual","xxx","goon","gooning",  -- sex/sexual restored from old script
+	"hentai","nsfw","onlyfans","fansly",
+	"cock","cum","pussy","boobs","tits","anal","oral","blowjob",
+	"sx","sxx","coom","coomm","cooom",
+	"vagina",
+	"penis",
+	"semen",
+	"busty",
+}
+
+-- FIX: Added "balls", "lick", "fuek", "ballcleaner" and other bypass variants
+local PROFANITY = {
+	-- 🔥 FUCK variants (added fuek, fuke, fueck)
+	"fuck","fuk","fck","fcuk","fcku","fku","fuc","fuuk","ffuck","fukk","fucc","fucuk","ffuk",
+	"fauck","fock","fok","fawk","f0ck","fack","faack","fak","fakk","fakkk","f@ck","f4ck",
+	"fuek","fuke","fueck","fuking","fukin",
+
+	-- 🔥 FREAKY
+	"freaky","freeky","freaki","freky","frky","freekay","freakey","freeki",
+	"freak","freek","freeek","frek","frk","fraky",
+
+	-- 🔥 SHIT
+	"shit","sh1t","sht","shitt","shiit","shhit","sshit","shite","shittt",
+
+	-- 🔥 BITCH
+	"bitch","btch","b1tch","bich","bitc","bithc","bbitch","biitch","bittch","bitchh",
+
+	-- 🔥 DICK
+	"dick","d1ck","dic","dik","dck","dikc","ddick","diick","dicck","dikk","dickk",
+
+	-- 🔥 PISS
+	"piss","pss","pis","piiiss","ppiss","pisss",
+
+	-- 🔥 CRAP
+	"crap","crp","craap","ccrap","crrap","crapp",
+
+	-- 🔥 DAMN
+	"damn","dmn","dam","damm","daamn","ddamn","dammn","damnn",
+
+	-- 🔥 SLUT
+	"slut","slt","slutt","sslut","sluut",
+
+	-- 🔥 WHORE
+	"whore","whre","whoe","whor","whhore","whoore","wghore","whorre",
+
+	-- 🔥 BALLS (FIX: was missing)
+	"balls","ballz","bal1s","bals",
+
+	-- 🔥 BALLSACK
+	"ballsack","bollock","balzak","ballzak","balssack","ballssack","balsack",
+
+	-- 🔥 BASTARD
+	"bastard","bastrd","bstrd","bbastard","bastardd","baastard",
+
+	-- 🔥 ASSHOLE
+	"asshole","arsehole","ashole","aswhole","asshoole","aashole","assholee","asshol",
+
+	-- 🔥 SUCK
+	"suck","sux","suxk","sck","ssuck","suuck","succk","succ","sukk",
+	-- NOTE: "sk" removed — 2 letters, false positives on basketball, disk, desk, task, risk, etc.
+
+	-- 🔥 LICK (FIX: was missing — "lick my balls" got through)
+	-- NOTE: only block sexual-context lick; standalone "lick" is caught by phrase detection below
+
+	-- 🔥 FAG
+	"fag","faggot","fagot","fggt","fgt","fagg","fagott","ffag","ffaggot","faggg","fagggot",
+
+	-- 🔥 CUCK
+	"cuck","cuckold","cuk","cucc","cukk","cuckk","cuckolded",
+
+	-- 🔥 SEXUAL TERMS
+	"tranny","trany","trannie","tranie","trann","ttranny","trannyy",
+	"dyke","dike","dyk","dke","dykee","ddyke","dyyke","dykke",
+	"shemale","shemal","shmale","shema","smale","sshemale","sheemale","shemmale",
+
+	-- 🔥 GOY
+	"goy","g0y","g@y",  -- g@y restored from old script
+
+	-- 🔥 N-WORD CORE
+	"nigger","nigga","nigg","niga","ngga","ngger","nigr","ngr","nig",
+
+	-- 🔥 N-WORD VARIANTS
+	"neigger","neigga","niggar","niggur","niggerr","niigga","nnigga",
+	"n!gg@","n!gga","n!gger","n1gg3r","n1gga",
+
+	-- 🔥 RAPE
+	"rape","rpe","raep","rrape","raape","rapee",
+
+	-- 🔥 KILL
+	"kill","kil","kkill","kiill","killl",
+
+	-- 🔥 SLANG
+	"deadass","deadas","dedass","dedas","dead ass","ded ass",
+
+	-- 🔥 CYKA BLYAT
+	"cyka","cykaa","cykka","cykkka","cyk",
+	"blyat","blyatt","blyattt","blayat","blayt","blya","blyaa",
+	"cyka blyat","cyka blyatt","cyka blayat","cyka blayt","cykablyat",
+
+	-- 🔥 STRIPPER
+	"stripper","strippr","striper","strpper","strippeer","striperr",
+	"str1pper","stripp3r","str!pper",
+
+	-- 🔥 PROSTITUTE
+	"prostitute","prosttute","prostitue","prostituute","prostitoot",
+	"pr0stitute","pr0stitue","pr0stitoot",
+
+	-- 🔥 GENITAL
+	"genital","genitals","genitall","genitalls",
+	"genitalia","genitlia","genetalia",
+	"g3nital","gen1tal","gen!tal",
+
+	-- 🔥 OTHER
+	"condom","phuck","phuk","phucc","phuq","phuuk",
+	"cunt","c*nt","cuunt","cuntt",
+	"arse","ars","arsee","arsse",
+	"hoe","hoee","ho3","h0e",
+	"masturbate","masturb8","masturbat","masturbation",
+
+	-- 🔥 TIT / TITS (missing from all lists)
+	"tit","tits","tiits","tiitt","titt","t1t","t1ts","t!t","t!ts",
+
+	-- 🔥 DIH / DIK slang variants (my dih, suk my dih)
+	"dih","dihh","diih","d1h",
+	"sukin","suking","sukn",
+
+	-- 🔥 BLAX (racial slur variant)
+	"blax",
+
+	-- 🔥 KAHOONAS / KAHUNAS (slang for genitals)
+	"kahoonas","kahunas","kahunnas","kahonas","kahunaas",
+
+	-- 🔥 GEX (sexual slang)
+	"gex","gexx","geex",
+
+	-- 🔥 PIZS / PIIS (piss variant)
+	"pizs","piis","piiss",
+
+	-- 🔥 FREAKY in sexual context (handled in phrases too)
+	-- standalone "freaky" blocked via phrase detection
+
+	-- 🔥 JEWEL OF SLURS
+	"jewboy","jewboi",
+}
+
+-- 🔥 SMART TOXIC DETECTION
+local function normalize(msg)
+	msg = msg:lower()
+	-- Special char substitutions before stripping
+	msg = msg:gsub("|", "i")
+	msg = msg:gsub("§", "s")
+	msg = msg:gsub("%$", "s")
+	msg = msg:gsub("!", "i")
+	msg = msg:gsub("@", "a")
+	msg = msg:gsub("0", "o")
+	msg = msg:gsub("1", "i")
+	msg = msg:gsub("3", "e")
+	msg = msg:gsub("4", "a")
+	msg = msg:gsub("5", "s")
+	msg = msg:gsub("7", "t")
+	msg = msg:gsub("[%p%c]", "")
+	msg = msg:gsub("%s+", "")
+	msg = msg:gsub("phoque", "fuck")
+	msg = msg:gsub("f0ck", "fuck")
+	msg = msg:gsub("ahh", "ass")
+	msg = msg:gsub("azz", "ass")
+	-- dih → dick
+	msg = msg:gsub("dih", "dick")
+	return msg
+end
+
+
+-- Detect disguised personal-information requests
+local function isUnsafeLocationRequest(msg)
+
+	local clean = msg:lower()
+		:gsub("[^a-z0-9]", "")
+
+	-- Normalize repeated R and L characters
+	local irlCheck = clean
+		:gsub("r+", "r")
+		:gsub("l+", "l")
+
+	local blockedIRLFollowups = {
+		["irl"] = true,
+		["andirl"] = true,
+		["whataboutirl"] = true,
+		["wataboutirl"] = true,
+		["whtaboutirl"] = true,
+		["howaboutirl"] = true,
+		["butirl"] = true,
+		["inreallife"] = true,
+	}
+
+	if blockedIRLFollowups[irlCheck] then
+		return true
+	end
+
+	-- Split punctuation cannot hide these phrases
+	local addressRequests = {
+		"whatsuraddress",
+		"whatsyouraddress",
+		"watsuraddress",
+		"watsyouraddress",
+		"whatisuraddress",
+		"whatisyouraddress",
+		"whatsuradress",
+		"whatsyouradress",
+		"watsuradress",
+		"watsyouradress",
+		"wheredoyoulive",
+		"wheredoulive",
+	}
+
+
+	local gameContext =
+		clean:find("ingame", 1, true)
+		or clean:find("inthegame", 1, true)
+		or clean:find("inroblox", 1, true)
+
+	for _, phrase in ipairs(addressRequests) do
+		if clean:find(phrase, 1, true) then
+			if phrase:find("address", 1, true)
+				or phrase:find("adress", 1, true)
+				or not gameContext then
+				return true
+			end
+		end
+	end
+
+	-- Direct requests about real-life location
+	if clean:find("yourlocationirl", 1, true)
+		or clean:find("urlocationirl", 1, true)
+		or clean:find("andirl", 1, true)
+		or clean:find("whataboutirl", 1, true) then
+		return true
+	end
+
+	return false
+end
+
+
+local function isSafeGameQuestion(message)
+	local text = message:lower()
+		:gsub("[^a-z0-9]", " ")
+		:gsub("%s+", " ")
+		:match("^%s*(.-)%s*$")
+
+	-- Do not exempt explicitly real-life questions
+	if text:match("%f[%a]irl%f[%A]")
+		or text:find("in real life", 1, true) then
+		return false
+	end
+
+	-- Where does someone live in the game?
+	local subject = text:match(
+		"^where do ([%a]+) live"
+	) or text:match(
+		"^where does ([%a]+) live"
+	)
+
+	if subject then
+		local pronouns = {
+			you = true, u = true,
+			he = true, she = true,
+			they = true
+		}
+
+		if pronouns[subject] then
+			local start = text:find(" in game", 1, true)
+				or text:find(" in the game", 1, true)
+				or text:find(" in roblox", 1, true)
+
+			if start and (
+				text:sub(start) == " in game"
+					or text:sub(start) == " in the game"
+					or text:sub(start) == " in roblox"
+				) then
+				return true
+			end
+		end
+	end
+
+	-- What should I do to him/her/them/etc.?
+	local person, ending = text:match(
+		"^what should i do to ([%a]+)(.*)$"
+	)
+
+	local pronouns = {
+		him = true, her = true,
+		them = true, they = true,
+		he = true, she = true,
+		you = true, u = true,
+		us = true, me = true
+	}
+
+	if pronouns[person] then
+		return ending == ""
+			or ending == " in game"
+			or ending == " in the game"
+			or ending == " in roblox"
+	end
+
+	return false
+end
+
+-- Targeted moderation regression fixes (Oct 2026)
+-- Run these before broad checks so the reported reason is accurate.
+local function checkReportedBypasses(message)
+	local raw = tostring(message or ""):lower()
+	local compact = raw
+		:gsub("0", "o"):gsub("1", "i"):gsub("3", "e")
+		:gsub("4", "a"):gsub("5", "s"):gsub("7", "t")
+		:gsub("@", "a"):gsub("!", "i")
+		:gsub("[^a-z]", "")
+
+	-- Specific categories must take precedence over generic profanity/sexual flags.
+	if compact:find("freerobux", 1, true)
+		and (compact:find("clickmy", 1, true)
+			or compact:find("link", 1, true)
+			or compact:find("buy", 1, true)) then
+		return true, "scam"
+	end
+
+	local asksLocation = compact:find("wheredoyoulive", 1, true)
+		or compact:find("wheredoulive", 1, true)
+	local inGame = compact:find("ingame", 1, true)
+		or compact:find("inthegame", 1, true)
+		or compact:find("inroblox", 1, true)
+	local realLife = compact:find("irl", 1, true)
+		or compact:find("inreallife", 1, true)
+	if asksLocation and (realLife or not inGame) then
+		return true, "personal_safety"
+	end
+
+	if compact:find("whatschooldougoto", 1, true)
+		or compact:find("whatschooldoyougoto", 1, true)
+		or compact:find("areuhomealonern", 1, true)
+		or compact:find("areyouhomealonern", 1, true)
+		or compact:find("areuhomealone", 1, true)
+		or compact:find("areyouhomealone", 1, true) then
+		return true, "personal_safety"
+	end
+
+	if compact:find("letstalkonsnap", 1, true)
+		or compact:find("letstalkonsnapchat", 1, true)
+		or compact:find("checkmyprofileformysocials", 1, true) then
+		return true, "contact_platform"
+	end
+
+	local harassment = {
+		"uranidiot", "youreanidiot", "youareanidiot",
+		"nobodylikesu", "nobodylikesyou",
+		"youaresostupid", "youaresostoopid", "yoursostupid", "uaresostupid",
+		"justshutup", "uaretrashatthisgame", "youaretrashatthisgame",
+		"goawaynobodywantsuhere", "goawaynobodywantsyouhere",
+	}
+	for _, phrase in ipairs(harassment) do
+		if compact:find(phrase, 1, true) then
+			return true, "harassment"
+		end
+	end
+
+	local threats = {
+		"ihopeudie", "ihopeyoudie", "ushoulddie", "youshoulddie",
+		"imgonnahurtu", "imgonnahurtyou", "imgoingtohurtu", "imgoingtohurtyou",
+		"illfinduirl", "illfindyouirl",
+	}
+	for _, phrase in ipairs(threats) do
+		if compact:find(phrase, 1, true) then
+			return true, "real_life_threat"
+		end
+	end
+
+	-- Distinguish spam from personal information or inappropriate content.
+	if (compact:match("^a+$") and #compact >= 12)
+		or (compact:match("^ha[ha]+$") and #compact >= 20)
+		or compact:match("^spamspamspamspamspamspam+$") then
+		return true, "toxic_spam"
+	end
+
+	return false, nil
+end
+
+local function isToxic(msg)
+
+	local regressionBlocked, regressionReason = checkReportedBypasses(msg)
+	if regressionBlocked then
+		return true, regressionReason
+	end
+
+	if isUnsafeLocationRequest(msg) then
+		return true, "personal_safety"
+	end
+
+	-- Exact harmless conversation exceptions
+	local check = msg:lower()
+		:gsub("[^a-z0-9]", " ")
+		:gsub("%s+", " ")
+		:match("^%s*(.-)%s*$")
+
+
+	local safeQuestions = {
+		["what should i do to him"] = true,
+		["what should i do to her"] = true,
+		["what should i do to them"] = true,
+
+		["what should i do to him in game"] = true,
+		["what should i do to her in game"] = true,
+		["what should i do to them in game"] = true,
+
+		["what should i do to him in the game"] = true,
+		["what should i do to her in the game"] = true,
+		["what should i do to them in the game"] = true,
+
+		["what should i do to him in roblox"] = true,
+		["what should i do to her in roblox"] = true,
+		["what should i do to them in roblox"] = true,
+	}
+
+
+	if safeQuestions[check] then
+		return false, nil
+	end
+
+	local m = normalize(msg)
+	local lower = msg:lower()
+	-- Normalize lower too for special chars
+	lower = lower:gsub("|", "i"):gsub("§", "s"):gsub("%$", "s"):gsub("!", "i"):gsub("@", "a")
+
+
+	-- TARGETED SAFETY AND HARASSMENT RULES
+	-- Run before any normal-conversation whitelist.
+
+	do
+		local safeText = " " .. msg:lower()
+			:gsub("[%p]", " ")
+			:gsub("%s+", " ")
+			:match("^%s*(.-)%s*$") .. " "
+
+		local compact = safeText:gsub("[^a-z]", "")
+
+		local targetedRules = {
+			-- Harassment directed at another person
+			{"you%s+are%s+an?%s+idiot", "harassment"},
+			{"you%s+are%s+an?%s+idiots?", "harassment"},
+			{"you%s+are%s+a%s+bad%s+person", "harassment"},
+			{"ur%s+a%s+bad%s+person", "harassment"},
+			{"youre%s+a%s+bad%s+person", "harassment"},
+			{"you%s+are%s+a%s+pred", "harassment"},
+			{"ur%s+a%s+pred", "harassment"},
+			{"youre%s+a%s+pred", "harassment"},
+
+			-- Requests to move conversations privately
+			{"send%s+me%s+pics", "contact_request"},
+			{"send%s+me%s+pictures", "contact_request"},
+			{"pm%s+me", "contact_request"},
+			{"inbox%s+me", "contact_request"},
+
+			-- Praise of a specifically blocked individual
+			{"diiddy%s+is%s+the%s+best", "extremism"},
+
+			-- Self-harm related statements
+			{"i%s+want%s+to%s+die", "self_harm"},
+			{"i%s+wanna%s+die", "self_harm"},
+
+			-- Potentially unsafe personal questions or requests
+			{"are%s+you%s+home%s+alone", "personal_safety"},
+			{"dont%s+tell%s+your%s+parents", "personal_safety"},
+			{"do%s+not%s+tell%s+your%s+parents", "personal_safety"},
+			{"what%s+school%s+do%s+you%s+go%s+to", "personal_safety"},
+			{"wanna%s+video%s+call", "contact_request"},
+			{"want%s+to%s+video%s+call", "contact_request"},
+
+			-- Real-life violence and threats
+			{"eliminate%s+him%s+irl", "real_life_threat"},
+			{"eliminate%s+her%s+irl", "real_life_threat"},
+			{"murder%s+him%s+irl", "real_life_threat"},
+			{"murder%s+her%s+irl", "real_life_threat"},
+			{"kill%s+him%s+irl", "real_life_threat"},
+			{"kill%s+her%s+irl", "real_life_threat"},
+			{"hurt%s+him%s+irl", "real_life_threat"},
+			{"hurt%s+her%s+irl", "real_life_threat"},
+
+			-- Asking about real-life locations
+			{"what%s+place%s+do%s+you%s+go%s+to%s+irl", "personal_safety"},
+			{"where%s+do%s+you%s+go%s+irl", "personal_safety"},
+			{"where%s+do%s+you%s+live%s+irl", "personal_safety"},
+			{"where%s+are%s+you%s+irl", "personal_safety"},
+
+
+			-- REAL-LIFE LOCATION QUESTIONS
+
+			-- Requests for another player's real-life address
+			{"wats%s+ur%s+address", "personal_safety"},
+			{"wats%s+your%s+address", "personal_safety"},
+			{"wat%s+is%s+ur%s+address", "personal_safety"},
+			{"wat%s+is%s+your%s+address", "personal_safety"},
+			{"whats%s+ur%s+address", "personal_safety"},
+			{"whats%s+your%s+address", "personal_safety"},
+			{"what%s+is%s+ur%s+address", "personal_safety"},
+			{"what%s+is%s+your%s+address", "personal_safety"},
+			{"where%s+do%s+you%s+live%s+irl", "personal_safety"},
+			{"where%s+s%s+ur%s+location", "personal_safety"},
+			{"where%s+s%s+your%s+location", "personal_safety"},
+			{"where%s+is%s+ur%s+location", "personal_safety"},
+			{"where%s+is%s+your%s+location", "personal_safety"},
+			{"what%s+is%s+ur%s+location%s+irl", "personal_safety"},
+			{"what%s+is%s+your%s+location%s+irl", "personal_safety"},
+
+			-- REAL-LIFE INTENT TOWARD SOMEONE
+			{"what%s+should%s+i%s+do%s+to%s+him%s+irl", "personal_safety"},
+			{"what%s+should%s+i%s+do%s+to%s+her%s+irl", "personal_safety"},
+			{"wat%s+should%s+i%s+do%s+to%s+him%s+irl", "personal_safety"},
+			{"wat%s+should%s+i%s+do%s+to%s+her%s+irl", "personal_safety"},
+			{"wht%s+should%s+i%s+do%s+to%s+him%s+irl", "personal_safety"},
+			{"wht%s+should%s+i%s+do%s+to%s+her%s+irl", "personal_safety"},
+		}
+
+
+		-- Block real-life location questions, allow in-game locations
+		local gameLocationQuestion = safeText:find(
+			" where do you live ", 1, true
+		) or safeText:find(
+			" where do u live ", 1, true
+		)
+
+		if gameLocationQuestion then
+			local inGame = safeText:find(" in game ", 1, true)
+				or safeText:find(" in the game ", 1, true)
+				or safeText:find(" in roblox ", 1, true)
+
+			if not inGame then
+				return true, "personal_safety"
+			end
+		end
+
+
+		for _, rule in ipairs(targetedRules) do
+			if safeText:find(rule[1]) then
+				return true, rule[2]
+			end
+		end
+
+		if compact:find("diiddyisthebest", 1, true) then
+			return true, "extremism"
+		end
+	end
+
+	-- 🔒 EXTREME word check — catches "I'm a predator", "I am a terrorist", "I'm a pred" etc.
+	-- These words are in the EXTREME list but isImVerbSentence() was bypassing them early
+	-- Must run BEFORE any early-return logic
+	do
+		local extremeWords = {
+			"predator","predetor","predd","predatorr",  -- pred is too short, caught below
+			"terrorist","terorist","terroristt",
+			"pedophile","pedofile","paedophile","pedo","paedo","pedofil",
+		}
+		for _, w in ipairs(extremeWords) do
+			if m:find(w, 1, true) then
+				return true, "extreme"
+			end
+		end
+		-- "pred" standalone — only block if it's the whole identity claim
+		-- "I'm a pred", "I am pred", "im pred", "I'm pred"
+		if m:find("imapred") or m:find("iamapred") or m:find("impred") or m:find("iampred") then
+			return true, "extreme"
+		end
+		-- Also catch just "pred" as standalone message
+		local trimmedLower = lower:match("^%s*(.-)%s*$") or lower
+		if trimmedLower == "pred" or trimmedLower == "predd" then
+			return true, "extreme"
+		end
+	end
+
+	-- 🔒 "ike" as standalone — anti-semitic slur (only when ALONE, not in "hike", "like", "bike" etc.)
+	do
+		local trimmedMsg = lower:match("^%s*(.-)%s*$") or lower
+		if trimmedMsg == "ike" or trimmedMsg == "ikee" or trimmedMsg == "iike" then
+			return true, "profanity"
+		end
+	end
+
+	-- 👪 Family references — EXPANDED to catch "ir mom", "ur mom", "yo mom", "ya mom"
+	local hasFamily =
+		m:find("urmom") or
+		m:find("irmom") or   -- "ir mom's bum" (typo for ur)
+		m:find("urmama") or
+		m:find("yourmom") or
+		m:find("yomom") or
+		m:find("yamom") or
+		m:find("hermom") or
+		m:find("hismom")
+
+	-- 🔞 Sexual / explicit verbs
+	local hasSexVerb =
+		m:find("clap") or
+		m:find("fuck") or
+		m:find("smashed") or
+		m:find("smashher") or
+		m:find("smashhim") or
+		m:find("bang") or
+		m:find("rail") or
+		m:find("pipe")
+
+	-- 🍑 Body slang
+	local hasBody =
+		m:find("cheek") or
+		m:find("melon") or
+		m:find("ass") or
+		m:find("bum") or     -- "ir mom's bum so soft"
+		m:find("butt") or
+		m:find("boob") or
+		m:find("tit")
+
+	if hasFamily and (hasSexVerb or hasBody) then
+		return true, "harassment"
+	end
+
+	-- "ir mom's bum so soft" — bum + soft = sexual body description about mom
+	if hasFamily and m:find("soft") then
+		return true, "sexual_content"
+	end
+
+	if m:find("clapped") and m:find("mom") then
+		return true, "harassment"
+	end
+
+	if m:find("smash") and m:find("mom") then
+		return true, "harassment"
+	end
+
+	-- 🔒 "lick my balls/dick/tits" — explicit sexual phrases
+	local joinedM = m -- already stripped
+	if joinedM:find("lickmy") or joinedM:find("lickur") or joinedM:find("lickyour") then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "I clapped so hard last night" — implicit sexual boast
+	if lower:find("clapped so hard", 1, true)
+		or lower:find("clapped her so", 1, true)
+		or lower:find("clapped him so", 1, true) then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "my balls/dih/dick better than u"
+	if (m:find("myball") or m:find("myballs") or m:find("mydick") or m:find("mydih")) then
+		local sportContext = lower:find("basketball") or lower:find("football") or lower:find("soccer")
+			or lower:find("bounce") or lower:find("throw") or lower:find("catch") or lower:find("kick")
+		if not sportContext then
+			return true, "sexual_content"
+		end
+	end
+
+	-- 🔒 "get freaky" / "get freaky on me" — sexual solicitation
+	if m:find("getfreaky") or m:find("gofreaky") or m:find("befreaky") then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "show me your kahoonas/kahunas" — genitals slang
+	if (m:find("showme") or m:find("showur") or m:find("showyour")) and
+		(m:find("kahoon") or m:find("kahun") or m:find("kahoona") or m:find("privat")) then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "touch you/me private parts" — grooming phrase
+	if (m:find("touch") or m:find("touching") or m:find("touchyou") or m:find("touchme")) and
+		(m:find("privat") or m:find("part")) then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "i'm gonna touch you" by itself is suspicious
+	if m:find("isgonnatouch") or m:find("igonntouch") or m:find("imgoingtouch") then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "i love touching kids" — grooming phrase (screenshot bypass)
+	-- Catches: "i love touching kids", "i luv touching kids", "love touching kids"
+	if (m:find("love") or m:find("like") or m:find("enjoy") or m:find("want")) and m:find("touchingkid") then
+		return true, "sexual_content"
+	end
+	-- Also catch the spaced version
+	if lower:find("touching kids", 1, true) or lower:find("touch kids", 1, true)
+		or lower:find("touche kids", 1, true) or lower:find("touchin kids", 1, true) then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "love killing people" / "love killing" — violence glorification
+	-- "kill" alone is in PROFANITY but "love killing people" needs explicit catch here
+	if (m:find("love") or m:find("enjoy") or m:find("like")) then
+		if m:find("killingpeople") or m:find("killingkids") or m:find("killinganyone")
+			or m:find("murderpeopl") or m:find("shootingpeopl") then
+			return true, "threat"
+		end
+		-- Spaced version
+		if lower:find("love killing people", 1, true)
+			or lower:find("love murdering people", 1, true)
+			or lower:find("love killing kids", 1, true)
+			or lower:find("enjoy killing people", 1, true)
+			or lower:find("like killing people", 1, true) then
+			return true, "threat"
+		end
+	end
+
+	-- 🔒 "love committing crimes" — crime glorification
+	if (m:find("love") or m:find("enjoy") or m:find("like")) and
+		(m:find("committingcrime") or m:find("doingilegal") or m:find("doingcrime")) then
+		return true, "threat"
+	end
+	if lower:find("love committing crimes", 1, true)
+		or lower:find("love committing crime", 1, true)
+		or lower:find("enjoy committing crimes", 1, true)
+		or lower:find("love doing crimes", 1, true) then
+		return true, "threat"
+	end
+
+	-- 🔒 ballcleaner / nonsense sexual compounds
+	local joined = lower:gsub("[^a-z]", "")
+	if joined:find("ballcleaner", 1, true)
+		or joined:find("ballwasher", 1, true)
+		or joined:find("ballpolish", 1, true) then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "bum so soft" with any context
+	if lower:find("bum so soft", 1, true)
+		or lower:find("bum is soft", 1, true)
+		or lower:find("bum's so soft", 1, true) then
+		return true, "sexual_content"
+	end
+
+	-- 🔒 "suk my dih" / "i luv sukin dih" — suk + dih combo
+	if (m:find("suk") or m:find("suck")) and (m:find("dih") or m:find("dik") or m:find("dick")) then
+		return true, "sexual_content"
+	end
+
+	return false, nil
+end
+
+-- 🔒 HARD BLOCK: sexual word "seggs"
+local HARD_SEXUAL_WORDS = {
+	"seggs",
+	"sem",
+	"porm",
+	"prn",
+}
+
+-- ✅ Explicit safe words that contain substrings like "cock"
+local BENIGN_SEX_SUBSTRINGS = {
+	["cockroach"] = true,
+	["cockroaches"] = true,
+}
+
+local SELF_HARM = {
+	"killyourself","kys","suicide","killmyself","cutmyself","hurtmyself",
+	"suicde","suicid","endmylife","endmyself","cutting","selfharm",
+	"suicidial","suicidal","suicida","suicidde",
+	-- Screenshot bypass: "keelyoself" = kill yourself
+	-- Both original AND collapsed forms (collapseRuns turns "keelyoself" → "kelyoself")
+	"keelyoself","kelyoself",   -- collapsed form
+	"keelurself","kelurself",   -- collapsed form
+	"killyoself","kilyoself",   -- collapsed form
+	"keelyourself","kelyourself",
+	"killuself","kiluself",
+	"killurself","kilurself",
+	"kyself","k y s",
+}
+
+local HARASSMENT = {
+	"idiot","stupid","loser","dumbass","dumb","retard","ugly","noob",
+	"moron","idot","stuid","dum","reard","tras","nob","retarted","retarded",
+	"stupidd","idioti","idiotc","idiotd","smartass",
+	"cornball","cornbal","cornbll","cornboll",
+	"diss","disss","dissss",
+	"corrd","corrdd","corrddd",
+}
+
+local ALWAYS_BLOCK_WORDS = {
+	["dissuading"] = true,
+	["dissuade"] = true,
+}
+
+-- FIX: SLUR_ROOTS — removed ultra-short roots "nga","nag","naga" that caused false positives
+-- on normal words like "language", "manage", "navigate", "garage"
+-- These are now only caught via PROFANITY list exact matches or whole-word checks
+local SLUR_ROOTS = {
+	"nigg", "nlg",
+	"nlgga","nlga",
+}
+
+local BLOCKED_STANDALONE_WORDS = {
+	["nga"] = true, ["ngaa"] = true, ["ngaaa"] = true,
+}
+
+-- 🚫 FULL SPANISH PROFANITY BLOCK LIST
+local FOREIGN_PROFANITY = {
+	"mierda","puta","puto","putita","putito",
+	"cabron","cabrón","cabrona","culero","culera",
+	"pendejo","pendeja","pendej0","pendej@",
+	"pinche","chingar","chingado","chingada","chingon","chingona",
+	"verga","verguita","vergon","huevon","huevón","huevona",
+	"maricon","maricón","marica","mariconcito",
+	"zorra","zorrillo","malparido","malparida",
+	"hijo de puta","hijueputa","culiao","culiada",
+	"weon","weona","guevon","guevón",
+	"coño","coñazo","mamaguevo","mamaguev0","mamagueb0",
+	"mamabicho","mamapinga","pinga","chocho","chocha",
+	"concha","conchetumare","conchatumadre","ctm",
+	"carajo","caraj0","carajazo",
+	"estupido","estúpido","estupida","estúpida",
+	"idiota","imbecil","imbécil","gilipollas","gilip0llas","gil",
+}
+
+local LATIN_FOREIGN_PROFANITY = {
+	"pula","pule","pulii","sugi","suge","muie","mui",
+	"futut","fututu","fututi","futu","fute","futea",
+	"pizda","pizdii","pizde","cacat","cacatu",
+	"curva","curve","curvar",
+	"prost","proasta","prostule","prostilor",
+	"idioata","idiotule","dracu","dracului","dracie",
+	"nenorocit","nenorocita","nenorocitule",
+	"baga","bagami","in gura","ingura","n gura",
+	"ma tii","matii","ma pis","mapis","ma fut","mafut",
+	"du te","dute","du-te",
+	"bagami pula","bagamipula","sugi pula","sugipula",
+	"sugi cur","sugicur","te fut","tefut","futu-ti","fututi","futu ti",
+	"siktir","siktirgit","orospu","orospucocugu",
+	"amk","amina","aminakoyim","piç","pic","piclik",
+	"göt","got","gotlek","bok","boklu","salak",
+	"gerizekalı","geriakalli","yarrak","yarak","oç","oc",
+	"pidhi","pidh","byth","bythë","bythe","qij","qihu","rrot","rrotë",
+	"kurwa","kurwy","kurwo","kurva","kurvo","kurve","kurvu","kurvama","kurvin","chuj","chuja","jebac","jebany","jebana",
+	"pierdol","pierdolic","pierdolony","skurwysyn","skurwiel",
+	"spierdalaj","zajebany","wpierdol",
+	"picka","pička","hovno","jebat","zkurveny",
+	"jebem","jebiga","kurac","kurca","sranje","jebi","jebes",
+	"bazmeg","basszameg","fasz","faszt","picsad","picsa","szar",
+	"kontol","memek","ngentot","jancok","bajingan",
+	"anjing","anjir","babi","bangsat",
+	"te n gura","tengura",
+}
+
+local function containsLatinForeignProfanity(lower, fuzzy)
+	local joined = lower:gsub("[^a-z]", "")
+	local collapsedJoined = collapseRuns(joined)
+
+	for _, term in ipairs(LATIN_FOREIGN_PROFANITY) do
+		local t = term:gsub("[^a-z]", "")
+		local tCollapsed = collapseRuns(t)
+
+		if matchesWholePhrase(lower, term) then
+			return true
+		end
+
+		if #tCollapsed >= 4 then
+			local e = tCollapsed:gsub("[%(%)%.%+%-%*%?%[%]%^%$%%]", "%%%0")
+			if collapsedJoined:match("%f[%a]" .. e .. "%f[%A]")
+				or collapsedJoined == tCollapsed then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+-- FIX: OFF_PLATFORM_KEYS — added color-coded app name bypasses
+local CONTACT_PLATFORMS = {
+	"discord","dicord","dscord","disc0rd","d1scord",
+	"whatsapp","watsapp","watsap","whatsap",
+	"snapchat","snap",
+	"instagram","insta",
+	"youtube","yt","tiktok",
+	"facebook","messenger","telegram","skype",
+	"twitter","x","twitch","twich","twitchtv",
+}
+
+local OFF_PLATFORM_KEYS = {
+	"discord","instagram","snapchat","whatsapp","telegram",
+	"facebook","messenger","twitter","tiktok","twitch",
+	"youtube","gmail","skype",
+	"googlemeet","googlemeets","meetgoogle",
+	"googledrive","googlechat",
+	"insta","snap","dc","yt","fb","ig","tt","sc","wa","x",
+	"discordgg","discordcom","instagramcom","twittercom",
+	-- FIX: Color-coded app bypass patterns (blue app = Discord, green app = WhatsApp)
+	"blueapp","blueplatform","blueapplication",
+	"greenapp","greenplatform","greenapplication",
+	"purpleapp","purpleplatform",
+}
+
+local CONTACT_PHRASES = {
+	"sendpic","sendphoto","sendnudes","sendnude",
+	"joinmyserver","joinserver","addme","addmeon",
+	"contactme","mychannel","ychannel",
+	"dmme","dm me","directmessage","pmme","privatemessage",
+	"followme","subscribeto","subscribeme",
+}
+
+local SCAM_PATTERNS = {
+	"bloxpink","blox.pink","freerobux","robuxreward","claimrobux",
+	"robuxgenerator","robuxgen","robuxgift","free robux",
+	"robux giveaway","robuxgiveaway","robux hack","robuxhack",
+	"bloxdrope","bloxdrop","blox drope","blox-drop","blox.drope",
+	"bobux","boobux","robuxx","robox","rbux","r0bux","rbx",
+}
+
+local EXTREME = {
+	"gotohell","go2hell","gtohell","gotohel","go2hel","gtohel",
+	"pred","predator","predetor","predd","predatorr",
+	"pedopred","childpred",
+	"terrorist","terorist","terror","teror","terroristt","terorist",
+	"pedo","paedo","pedophile","pedofile","pedofil","pedd",
+	"pedophilia","paedophilia","childabuser","childmolest",
+	"rapist","murderer","murdrer",
+	"jeffreyepstein","epstein","ebstein","ebstean","epstean","eppstein","epstien",
+	"diddy","pdiddy","pdidy","pddidy","didy","ddiddy","diiddy","didddy",
+	"seancombs","seancombes","seancoombs",
+	"diddle","diddling","diddler",
+	"charliekirk",
+	"hitler",
+	"schutzstaffel",
+	"sturmabteilung",
+	"atomwaffendivision",
+	"himmler",
+	"sturmbannfuhrer",
+	"sssturmbannfuhrer",
+	"ss reich",
+}
+
+local NAME_STOPWORDS = {
+	["hello"] = true, ["hi"] = true, ["hey"] = true, ["why"] = true, ["what"] = true, ["where"] = true,
+	["how"] = true, ["yes"] = true, ["no"] = true, ["ok"] = true, ["okay"] = true, ["gg"] = true,
+	["thanks"] = true, ["thank"] = true, ["pls"] = true, ["please"] = true, ["sorry"] = true,
+	["help"] = true, ["server"] = true, ["game"] = true, ["roblox"] = true, ["you"] = true,
+	["your"] = true, ["name"] = true,
+	["good"] = true, ["fine"] = true, ["great"] = true, ["well"] = true, ["alright"] = true,
+	["nice"] = true, ["cool"] = true, ["awesome"] = true,
+	["doing"] = true, ["feeling"] = true, ["feels"] = true, ["feel"] = true,
+	["def"] = true, ["not"] = true, ["just"] = true, ["still"] = true, ["probably"] = true,
+	["basically"] = true, ["literally"] = true, ["really"] = true, ["actually"] = true,
+	["maybe"] = true, ["kinda"] = true, ["sorta"] = true, ["gonna"] = true, ["going"] = true,
+	["trying"] = true, ["playing"] = true,
+}
+
+local COMMON_RESPONSE_WORDS = {
+	["good"] = true, ["fine"] = true, ["great"] = true, ["well"] = true, ["alright"] = true,
+	["ok"] = true, ["okay"] = true, ["nice"] = true, ["cool"] = true, ["awesome"] = true,
+	["bad"] = true, ["sick"] = true, ["tired"] = true, ["hungry"] = true, ["thirsty"] = true,
+	["happy"] = true, ["sad"] = true, ["excited"] = true, ["bored"] = true, ["angry"] = true,
+	["scared"] = true, ["nervous"] = true, ["confused"] = true, ["surprised"] = true,
+	["doing"] = true, ["feeling"] = true, ["feels"] = true, ["feel"] = true,
+	["here"] = true, ["there"] = true, ["back"] = true, ["ready"] = true, ["done"] = true,
+	["sure"] = true, ["certain"] = true, ["set"] = true, ["prepared"] = true,
+}
+
+local GIBBERISH_SAFE_WORDS = {
+	["hi"] = true, ["hey"] = true, ["hello"] = true, ["yes"] = true, ["no"] = true, ["ok"] = true,
+	["okay"] = true, ["gg"] = true, ["lol"] = true, ["wow"] = true, ["why"] = true, ["what"] = true,
+	["where"] = true, ["how"] = true, ["sorry"] = true, ["help"] = true, ["pls"] = true,
+	["please"] = true, ["page"] = true, ["rage"] = true, ["sage"] = true, ["cage"] = true,
+	["age"] = true, ["bag"] = true, ["tag"] = true, ["lag"] = true, ["dog"] = true, ["cat"] = true,
+	["bat"] = true, ["rat"] = true, ["boy"] = true, ["girl"] = true, ["man"] = true, ["woman"] = true,
+	["car"] = true, ["bus"] = true, ["van"] = true, ["train"] = true, ["house"] = true, ["home"] = true,
+	["room"] = true, ["door"] = true, ["book"] = true, ["pen"] = true, ["desk"] = true, ["chair"] = true,
+	["food"] = true, ["water"] = true, ["milk"] = true, ["juice"] = true, ["day"] = true, ["night"] = true,
+	["sun"] = true, ["moon"] = true, ["red"] = true, ["blue"] = true, ["green"] = true, ["yellow"] = true,
+	["one"] = true, ["two"] = true, ["three"] = true, ["four"] = true, ["bff"] = true, ["omg"] = true,
+	["brb"] = true, ["lmao"] = true, ["rofl"] = true, ["ttyl"] = true, ["idk"] = true, ["tbh"] = true,
+	["btw"] = true, ["imo"] = true, ["afaik"] = true, ["jk"] = true, ["np"] = true, ["thx"] = true,
+	["ty"] = true, ["yw"] = true, ["gl"] = true, ["hf"] = true, ["feeling"] = true, ["great"] = true,
+	["hope"] = true, ["ur"] = true, ["hallooo"] = true, ["halloo"] = true, ["hallo"] = true,
+	["doing"] = true, ["game"] = true, ["play"] = true, ["wanna"] = true, ["know"] = true, ["bro"] = true,
+	["last"] = true, ["time"] = true, ["did"] = true, ["are"] = true, ["you"] = true, ["u"] = true,
+	["good"] = true, ["nice"] = true, ["cool"] = true, ["awesome"] = true, ["yeah"] = true, ["yep"] = true,
+	["sure"] = true, ["maybe"] = true, ["probably"] = true, ["really"] = true, ["actually"] = true,
+	["think"] = true, ["feel"] = true, ["like"] = true, ["love"] = true, ["hate"] = true, ["enjoy"] = true,
+	["fun"] = true, ["boring"] = true, ["interesting"] = true, ["amazing"] = true, ["haha"] = true,
+}
+
+local SAFE_EXACT_WORDS = {
+	["message"] = true,
+	["messages"] = true,
+}
+
+local SAFE_ACRONYMS = {
+	["tsb"] = true,
+	["brb"] = true,
+	["idk"] = true,
+	["irl"] = true,
+}
+
+local SAFE_EXACT_MESSAGE = {
+	["hi"] = true, ["hey"] = true, ["gg"] = true, ["lol"] = true, ["ok"] = true, ["okay"] = true,
+	["page"] = true, ["marriage"] = true, ["mariage"] = true,
+	["hii"] = true, ["hiii"] = true, ["hiiii"] = true, ["hiiiii"] = true,
+	["heyy"] = true, ["heyyy"] = true, ["heyyyy"] = true,
+	["helloo"] = true, ["hellooo"] = true, ["helloooo"] = true,
+	["hallo"] = true, ["halloo"] = true, ["hallooo"] = true,
+	["r15"] = true, ["r6"] = true,
+}
+
+local BENIGN_RAPE_WORDS_EXACT = {
+	["grape"] = true, ["grapes"] = true, ["grapefruit"] = true, ["scrape"] = true, ["scraped"] = true,
+	["scrapes"] = true, ["drape"] = true, ["drapes"] = true,
+	["experiment"] = true, ["experiments"] = true, ["experimental"] = true, ["experimenting"] = true,
+	["testing"] = true, ["test"] = true, ["tested"] = true, ["tests"] = true,
+	["swish"] = true, ["swishing"] = true, ["swished"] = true,
+	["fixing"] = true, ["fix"] = true, ["fixed"] = true, ["fixes"] = true,
+	["freeze"] = true, ["freezing"] = true, ["froze"] = true, ["frozen"] = true,
+	["warp"] = true, ["warps"] = true, ["warped"] = true, ["warping"] = true,
+	["damage"] = true, ["damages"] = true, ["damaged"] = true, ["damaging"] = true,
+	["permission"] = true,
+	["permissions"] = true,
+	["semester"] = true,
+	["seminar"] = true,
+	["classical"] = true,
+	["classic"] = true,
+	["assassin"] = true,
+	["passage"] = true,
+	["cumulative"] = true,
+	["document"] = true,
+	["documents"] = true,
+	["analysis"] = true,
+}
+
+local SAFE_TAG_PHRASES = {
+	"hashtag", "hashtags",
+	"nametag", "nametags",
+	"name tag", "name tags",
+	"hash tag", "hash tags",
+}
+
+local SAFE_MULTIWORD_PHRASES = {
+	"marine corps",
+}
+
+local BENIGN_NIG_WORDS_EXACT = {
+	["night"] = true, ["nights"] = true, ["nightly"] = true, ["nighttime"] = true,
+	["nightmare"] = true, ["nightmares"] = true, ["nightingale"] = true,
+	["knight"] = true, ["knights"] = true, ["knighthood"] = true,
+	["ignite"] = true, ["ignited"] = true, ["ignition"] = true,
+	["benign"] = true, ["benignly"] = true,
+	["design"] = true, ["designs"] = true, ["designed"] = true, ["designing"] = true, ["designer"] = true,
+	["resign"] = true, ["resigns"] = true, ["resigned"] = true, ["resigning"] = true, ["resignation"] = true,
+	["sign"] = true, ["signs"] = true, ["signed"] = true, ["signing"] = true, ["signature"] = true,
+	["assign"] = true, ["assigns"] = true, ["assigned"] = true, ["assigning"] = true, ["assignment"] = true,
+	["campaign"] = true, ["campaigns"] = true, ["campaigning"] = true,
+	["reign"] = true, ["reigns"] = true, ["reigned"] = true, ["reigning"] = true,
+	["foreign"] = true, ["foreigner"] = true, ["foreigners"] = true,
+	["sovereign"] = true, ["sovereignty"] = true,
+}
+
+local function containsWhitelistedWord(text, lower, fuzzy)
+	local trimmed = lower:match("^%s*(.-)%s*$") or lower
+	if BENIGN_RAPE_WORDS_EXACT[trimmed] then return true end
+	if BENIGN_NIG_WORDS_EXACT[trimmed] then return true end
+	for word in lower:gmatch("%w+") do
+		if BENIGN_RAPE_WORDS_EXACT[word] then return true end
+		if BENIGN_NIG_WORDS_EXACT[word] then return true end
+	end
+	for whitelistedWord, _ in pairs(BENIGN_RAPE_WORDS_EXACT) do
+		if matchesWholePhrase(lower, whitelistedWord) then return true end
+	end
+	for whitelistedWord, _ in pairs(BENIGN_NIG_WORDS_EXACT) do
+		if matchesWholePhrase(lower, whitelistedWord) then return true end
+	end
+	return false
+end
+
+local function looksLikeNameWord(w)
+	if not w:match("^[a-z]+$") then return false end
+	if NAME_STOPWORDS[w] then return false end
+	local len = #w
+	if len < 3 or len > 12 then return false end
+	if not w:match("[aeiou]") then return false end
+	return true
+end
+
+-- FIX: detectOffPlatform now also catches color-code app bypass ("blue app" = Discord)
+local function detectOffPlatform(normalizedJoined)
+	for _, key in ipairs(OFF_PLATFORM_KEYS) do
+		if normalizedJoined:find(key, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- NEW: Detect heavily obfuscated Discord/platform names
+-- Catches: "d,c....cc?", "d.i.s.c.o.r.d", "D-I-S-C-O-R-D", etc.
+-- Method: strip ALL non-letters and check if what remains contains a platform name
+-- Stronger platform alias detector
+local PLATFORM_ALIASES = {
+	-- Discord
+	"discord", "dicord", "dscord", "disc0rd", "d1scord", "discoord", "discor", "cord",
+
+	-- Snapchat
+	"snapchat", "schat", "snap chat",
+
+	-- Instagram
+	"instagram", "insta", "instgram", "1nsta", "1nstagram",
+
+	-- TikTok
+	"tiktok", "tik tok", "tik-tok", "tictok", "tiktik", "tikti", "toktok",
+
+	-- Snapchat
+	"snapchat", "snap", "snapp", "snapchatt",
+
+	-- WhatsApp
+	"whatsapp", "watsapp", "whatsap", "watsap", "wa",
+
+	-- YouTube
+	"youtube", "youtu", "yt",
+
+	-- Other platforms
+	"facebook", "fb", "messenger", "telegram", "skype", "twitter", "twitch",
+}
+
+local SHORT_PLATFORM_ALIASES = {
+	["dc"] = "discord",
+	["ig"] = "instagram",
+	["sc"] = "snapchat",
+	["wa"] = "whatsapp",
+	["yt"] = "youtube",
+	["tt"] = "tiktok",
+	["fb"] = "facebook",
+}
+
+local function normalizePlatformCompact(raw)
+	local s = tostring(raw or ""):lower()
+
+	s = s
+		:gsub("|", "i")
+		:gsub("!", "i")
+		:gsub("1", "i")
+		:gsub("0", "o")
+		:gsub("3", "e")
+		:gsub("4", "a")
+		:gsub("5", "s")
+		:gsub("7", "t")
+		:gsub("@", "a")
+
+	s = s:gsub("[^a-z]", "")
+	s = collapseRuns(s)
+
+	return s
+end
+
+local function findPlatformAliasInCompact(compact, allowShort)
+	compact = tostring(compact or "")
+
+	for _, alias in ipairs(PLATFORM_ALIASES) do
+		local cleanAlias = normalizePlatformCompact(alias)
+
+		if #cleanAlias >= 4 and compact:find(cleanAlias, 1, true) then
+			return true, cleanAlias
+		end
+	end
+
+	if allowShort then
+		for short, platform in pairs(SHORT_PLATFORM_ALIASES) do
+			if compact == short then
+				return true, platform
+			end
+		end
+	end
+
+	return false, nil
+end
+
+-- Detect heavily obfuscated platform names
+-- Catches:
+-- "d.i.s.c.o.r.d"
+-- "dis cord?"
+-- "insta??"
+-- "tiktik??"
+-- "d,c"
+local function detectObfuscatedPlatform(raw)
+	local lettersOnly = normalizePlatformCompact(raw)
+
+	local hit, platform = findPlatformAliasInCompact(lettersOnly, #lettersOnly <= 3)
+	if hit then
+		return true, platform
+	end
+
+	return false, nil
+end
+
+-- FIX: detectColorCodedAppBypass — catches "blue app", "the blue one", "greeen platform" etc.
+-- These are common bypass attempts for Discord (blue), WhatsApp (green), Snapchat (yellow)
+local COLOR_APP_MAP = {
+	-- "blue" alone doesn't block, but "blue app/platform/thing/chat" does
+	{color="blue",   platform="discord"},
+	{color="green",  platform="whatsapp"},
+	{color="yellow", platform="snapchat"},
+	{color="purple", platform="twitch"},
+	{color="pink",   platform="instagram"},
+}
+
+local function detectColorCodedApp(lower)
+	-- Collapse repeated letters so "bluee", "blueee", "appppp" all normalize correctly
+	local collapsed = collapseRuns(lower:gsub("[^a-z ]", " "))
+	-- Also normalize "blew" → "blue" (common misspelling bypass: "blew up?" = "blue app?")
+	local normalized = lower:gsub("blew", "blue"):gsub("bluw", "blue"):gsub("bloo", "blue")
+	local appWords = {"app", "platform", "application", "thing", "chat", "message", "msg", "dm", "server", "link"}
+	-- "up" added: "blew up?" = "blue app?" bypass
+	for _, entry in ipairs(COLOR_APP_MAP) do
+		-- Check original, collapsed, and normalized (blew→blue) for the color name
+		if lower:find(entry.color, 1, true) or collapsed:find(entry.color, 1, true)
+			or normalized:find(entry.color, 1, true) then
+			for _, appWord in ipairs(appWords) do
+				-- Check both original and collapsed/normalized for the app word
+				if lower:find(appWord, 1, true) or collapsed:find(appWord, 1, true)
+					or normalized:find(appWord, 1, true) then
+					return true, entry.platform
+				end
+			end
+		end
+	end
+	return false, nil
+end
+
+local function hasContactIntent(lower)
+	local letters = lower:gsub("[^a-z]", "")
+	local collapsed = collapseRuns(letters)
+
+	-- ✅ ALWAYS ALLOW: "add me on roblox"
+	if lower:match("%f[%a]add%s+me%s+on%s+roblox%f[%A]")
+		or lower:match("%f[%a]add%s+me%s+on%s+roblox%s*$")
+		or collapsed:find("addmeonroblox", 1, true) then
+		return false
+	end
+
+	-- 🚫 BLOCK: Explicit solicitation phrases — unambiguously trying to redirect off-platform
+	local hardSolicitPhrases = {
+		"addmeon", "followmeon", "dmmeon", "contactmeon",
+		"joinmyon", "joinmy",
+		"heresmydiscord", "heresmysnap", "heresmyinsta",
+		"mydiscord", "mysnap", "myinstagram", "mywhatsapp",
+		"mytelegram", "mytwitter", "mytiktok",
+		"discordis", "discordtag", "snapis", "instais",
+		"mydc", "dcis", "myig", "igis",
+		"whatsyourdiscord", "whatisyourdiscord",
+		"whatsyoursnap", "whatsyourinsta",
+		"urdiscord", "ursnap", "urinsta", "urwhatsapp",
+		"blewapp", "blewplatform",
+	}
+	for _, phrase in ipairs(hardSolicitPhrases) do
+		if collapsed:find(phrase, 1, true) then
+			return true
+		end
+	end
+
+	-- 🚫 BLOCK: Direct "contact me" action verbs
+	if lower:match("%f[%a]add%s+me%f[%A]")
+		or lower:match("%f[%a]follow%s+me%f[%A]")
+		or lower:match("%f[%a]dm%s+me%f[%A]")
+		or lower:match("%f[%a]hmu%f[%A]")
+		or lower:match("%f[%a]hit%s+me%s+up%f[%A]")
+		or lower:match("%f[%a]contact%s+me%f[%A]")
+		or lower:match("%f[%a]reach%s+me%f[%A]") then
+		return true
+	end
+
+	-- 🚫 BLOCK: "meet me" / "meet up" — trying to arrange off-platform meetup
+	if lower:match("%f[%a]meet%s+me%f[%A]") or lower:match("%f[%a]meet%s+up%f[%A]") then
+		return true
+	end
+
+	-- 🚫 BLOCK: Asking for someone's specific account on a platform
+	-- "whats your discord", "ur snap", "your instagram"
+	-- Only block possessive + platform (not "have you seen Instagram")
+	if collapsed:find("whatsyour") or collapsed:find("whatisyour") then
+		local askPlatforms = {
+			"discord", "snapchat", "instagram", "whatsapp",
+			"telegram", "tiktok", "twitter", "twitch",
+		}
+		for _, p in ipairs(askPlatforms) do
+			if collapsed:find(p, 1, true) then return true end
+		end
+	end
+	if collapsed:find("ursnapchat") or collapsed:find("urdiscord")
+		or collapsed:find("urinsta") or collapsed:find("urwhatsapp") then
+		return true
+	end
+
+	-- 🚫 BLOCK: Short-form handle requests with possessive + ? 
+	-- "ur dc?", "your ig?" — but NOT "is dc good?" or "whats on ig?"
+	local hasPossessive = lower:match("%f[%a]ur%f[%A]") or lower:match("%f[%a]your%f[%A]")
+	local isQuestion = lower:find("?") ~= nil
+	if hasPossessive and isQuestion then
+		local shortCodes = { "dc", "sc", "ig", "wa", "tt" }
+		for _, code in ipairs(shortCodes) do
+			if lower:match("%f[%a]" .. code .. "%f[%A]") then
+				return true
+			end
+		end
+	end
+
+	-- 🚫 BLOCK: "join my X", "text me on X", "find me on X" + platform name
+	local isRedirecting =
+		lower:find("%f[%a]join%s+my%f[%A]") or
+		lower:find("%f[%a]text%s+me%f[%A]") or
+		lower:find("%f[%a]msg%s+me%f[%A]") or
+		lower:find("%f[%a]message%s+me%f[%A]") or
+		lower:find("%f[%a]find%s+me%s+on%f[%A]")
+	if isRedirecting then
+		local platformNames = {
+			"discord", "snapchat", "instagram", "whatsapp",
+			"telegram", "tiktok", "twitter", "twitch",
+			"facebook", "messenger", "skype", "gmail",
+		}
+		for _, platform in ipairs(platformNames) do
+			if collapsed:find(platform, 1, true) then return true end
+		end
+	end
+
+	return false
+end
+
+local function isImVerbSentence(trimmed)
+	if not (trimmed:match("^i[%s']*m%s+%a+")
+		and not trimmed:match("^i[%s']*m%s+%a+%s*$")) then
+		return false
+	end
+	-- CRITICAL: Do NOT allow early-return if sentence contains an EXTREME word
+	-- "I'm a predator", "I'm a terrorist", "I'm a pedo" must NOT be bypassed
+	local extremeCheck = trimmed:lower():gsub("[^a-z]", "")
+	local extremeImWords = {
+		"predator","predetor","terrorist","terorist","pedophile","pedofile",
+		"paedophile","pedo","paedo","pred","rapist","murderer","killer",
+	}
+	for _, w in ipairs(extremeImWords) do
+		if extremeCheck:find(w, 1, true) then
+			return false  -- Do NOT early-return; let normal checks run
+		end
+	end
+	return true
+end
+
+local function looksLikeLetterGibberish(trimmed, messageLength)
+	if messageLength > 30 then return false end
+	if not trimmed:match("^[a-z]+$") then return false end
+	if SAFE_ACRONYMS[trimmed] then return false end
+	if GIBBERISH_SAFE_WORDS[trimmed] then return false end
+	local len = #trimmed
+	if len < 4 or len > 20 then return false end
+	if trimmed:match("[aeiouy]") then return false end
+	return true
+end
+
+local function containsCringe(lower, fuzzy)
+	if matchesWholePhrase(lower, "ass") then return true end
+	if lower:find("sybau", 1, true) or fuzzy:find("sybau", 1, true) then return true end
+	local cringeFuzzy = {"skibidi","skbidi","skibdi","skibidy","skbidy","skibid"}
+	for _, w in ipairs(cringeFuzzy) do
+		if fuzzy:find(w, 1, true) then return true end
+	end
+	return false
+end
+
+local function isSafeFinishPhrase(lower, fuzzy)
+	return lower:find("finish it") or lower:find("finished it") or lower:find("finish this")
+		or lower:find("to finish it") or fuzzy:find("finishit", 1, true) or fuzzy:find("finishedit", 1, true)
+end
+
+local function isRandomAlnumToken(fuzzy, lettersOnly, digitsOnly, messageLength)
+	if messageLength > 60 then return false end
+	if lettersOnly == "" or digitsOnly == "" then return false end
+	if fuzzy:find("[^%w]") then return false end
+	local len = #fuzzy
+	return len >= 4 and len <= 50
+end
+
+local function looksLikeUrl(s)
+	return s:find("https://", 1, true) or s:find("http://", 1, true)
+		or s:match("%f[%w]%w+%.gg%f[%A]")
+		or s:match("%f[%w][%w%-]+%.%a%a+%f[%A]")
+end
+
+local function looksLikeOffPlatformPath(text)
+	local lower = text:lower()
+	local compact = lower:gsub("%s+", "")
+	local platforms = {
+		"google", "meet", "discord", "youtube", "youtu",
+		"twitter", "tiktok", "instagram", "insta",
+		"snapchat", "snap", "telegram", "whatsapp",
+		"twitch", "gmail", "skype", "facebook", "fb",
+	}
+	for _, p in ipairs(platforms) do
+		if compact:match("^" .. p .. "/[%w%-_]+")
+			or compact:match("[%s%p]" .. p .. "/[%w%-_]+")
+			or compact:match(p .. "/[%w%-_]+") then
+			return true
+		end
+	end
+	return false
+end
+
+local function looksLikeImageUrl(s)
+	local lower = string.lower(s)
+	local imagePatterns = {
+		"imgur%.com", "i%.imgur%.com", "cdn%.discordapp%.com", "discord%.gg", "discordapp%.com",
+		"media%.discordapp%.com", "prntscr%.com", "prnt%.sc", "gyazo%.com", "puu%.sh",
+		"tinypic%.com", "photobucket%.com", "flickr%.com", "instagram%.com", "i%.instagram%.com",
+		"pbs%.twimg%.com", "pixiv%.net", "deviantart%.com", "artstation%.com", "redd%.it",
+		"i%.redd%.it", "reddit%.com", "i%.redditmedia%.com", "cdn%.redditmedia%.com",
+		"twimg%.com", "t%.co", "bit%.ly", "tinyurl%.com", "shortlink", "image%.", "img%.", "pic%.", "photo%.",
+	}
+	local imageExtensions = {
+		"%.jpg", "%.jpeg", "%.png", "%.gif", "%.bmp", "%.webp", "%.svg", "%.ico", "%.tiff", "%.tif", "%.heic", "%.heif",
+	}
+	for _, pattern in ipairs(imagePatterns) do
+		if lower:find(pattern) then return true end
+	end
+	for _, ext in ipairs(imageExtensions) do
+		if lower:find(ext .. "[^%w]?") or lower:find(ext .. "$") then return true end
+	end
+	if lower:find("data:image/") then return true end
+	return false
+end
+
+local function isPlatformContentConversation(text)
+	local lower = tostring(text or ""):lower()
+
+	local platformWords = {
+		"tiktok", "tik tok", "youtube", "yt", "instagram", "insta",
+		"snapchat", "snap", "discord", "twitch", "twitter", "facebook"
+	}
+
+	local contentWords = {
+		"video", "vid", "clip", "meme", "post", "reel", "short", "shorts",
+		"trend", "trending", "channel", "streamer", "stream", "live",
+		"song", "music", "audio", "sound", "edit", "edits",
+		"content", "creator", "youtuber", "tiktoker",
+		"game", "gaming", "gameplay",
+		"news", "article", "story",
+		"heard", "seen", "watched", "saw", "watch",
+		"about", "like", "love", "hate", "funny", "cool", "good", "bad"
+	}
+
+	local hasPlatform = false
+	for _, p in ipairs(platformWords) do
+		if lower:find(p, 1, true) then
+			hasPlatform = true
+			break
+		end
+	end
+
+	if not hasPlatform then
+		return false
+	end
+
+	for _, cw in ipairs(contentWords) do
+		if lower:match("%f[%a]" .. cw .. "%f[%A]") then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function checkSplitWords(player, currentMessage)
+	if not messageHistory[player] or #messageHistory[player] < 1 then
+		return false, nil
+	end
+
+	local recentMessages = {}
+	local historySize = #messageHistory[player]
+
+	-- FIX: look back further (was 2, now 5) so multi-message spelling bypasses
+	-- ("s up" / "h is h" / "i was i" / "t for t") get caught
+	for i = historySize, math.max(1, historySize - 5), -1 do
+		table.insert(recentMessages, 1, messageHistory[player][i])
+	end
+
+	table.insert(recentMessages, currentMessage)
+
+	-- NEW: Catch split phone-number sharing using number words
+	-- Examples:
+	-- "call" / "me" / "my num" / "is" / "five four three two"
+	-- "my numbers" / "is" / "one two three four five six seven"
+	do
+		local NUMBER_WORDS = {
+			["zero"] = "0", ["oh"] = "0", ["o"] = "0",
+			["one"] = "1", ["won"] = "1",
+			["two"] = "2", ["to"] = "2", ["too"] = "2",
+			["three"] = "3", ["tree"] = "3",
+			["four"] = "4", ["for"] = "4", ["fore"] = "4",
+			["five"] = "5",
+			["six"] = "6",
+			["seven"] = "7",
+			["eight"] = "8", ["ate"] = "8",
+			["nine"] = "9",
+		}
+
+		local function normalizePhoneText(text)
+			local s = tostring(text or ""):lower()
+
+			-- Keep digits for phone detection, but remove separators like // . - _
+			s = s
+				:gsub("|", "i")
+				:gsub("!", "i")
+				:gsub("@", "a")
+				:gsub("[^a-z0-9]", " ")
+				:gsub("%s+", " ")
+
+			return s:match("^%s*(.-)%s*$") or s
+		end
+
+		local function compactPhoneContext(text)
+			local s = normalizePhoneText(text):gsub("%s+", "")
+
+			-- Only for detecting words like c4llme / n0mber
+			s = s
+				:gsub("0", "o")
+				:gsub("1", "i")
+				:gsub("3", "e")
+				:gsub("4", "a")
+				:gsub("5", "s")
+				:gsub("7", "t")
+
+			return s
+		end
+
+		local function isCodedShotContext(text)
+			local compact = compactPhoneContext(text)
+
+			return compact:find("numbersaretheshots", 1, true)
+				or compact:find("numbersareshots", 1, true)
+				or compact:find("mynumbersaretheshots", 1, true)
+				or compact:find("mynumbersareshots", 1, true)
+				or compact:find("numberaretheshot", 1, true)
+				or compact:find("numberareshot", 1, true)
+				or compact:find("shotsarenumbers", 1, true)
+				or compact:find("shotsarethenumbers", 1, true)
+				or compact:find("shotisnumber", 1, true)
+				or compact:find("shotmeansnumber", 1, true)
+				or compact:find("shotmeansdigit", 1, true)
+				or compact:find("shotsmeannumbers", 1, true)
+				or compact:find("shotsmeandigits", 1, true)
+		end
+
+		local function hasNormalPhoneContext(text)
+			local compact = compactPhoneContext(text)
+
+			local hasCallOrText =
+				compact:find("callme", 1, true)
+				or compact:find("textme", 1, true)
+				or compact:find("messageme", 1, true)
+
+			local hasNumberIntro =
+				compact:find("mynumber", 1, true)
+				or compact:find("mynumbers", 1, true)
+				or compact:find("mynum", 1, true)
+				or compact:find("myphone", 1, true)
+				or compact:find("numberis", 1, true)
+				or compact:find("numbersis", 1, true)
+				or compact:find("numis", 1, true)
+				or compact:find("phoneis", 1, true)
+				or compact:find("heresmynumber", 1, true)
+				or compact:find("heresmyphone", 1, true)
+
+			local asksForNumber =
+				compact:find("givemeyournumber", 1, true)
+				or compact:find("givemeurnumber", 1, true)
+				or compact:find("whatsyournumber", 1, true)
+				or compact:find("whatsurnumber", 1, true)
+				or compact:find("watsyournumber", 1, true)
+				or compact:find("watsurnumber", 1, true)
+
+			return hasNumberIntro or asksForNumber or (hasCallOrText and hasNumberIntro)
+		end
+
+		local function hasPhoneSharingContext(text)
+			return hasNormalPhoneContext(text) or isCodedShotContext(text)
+		end
+
+		local function extractPhoneDigitsFromText(text)
+			local clean = normalizePhoneText(text)
+			local digits = {}
+			local currentRun = 0
+			local longestRun = 0
+
+			local function wordToDigit(word)
+				word = tostring(word or ""):lower()
+				word = word:gsub("[^a-z0-9]", "")
+
+				if NUMBER_WORDS[word] then
+					return NUMBER_WORDS[word]
+				end
+
+				-- NEW: coded "shot" phone bypass.
+				-- Only extracts from patterns like:
+				-- oneshot, two-shot, shotfour, three shot
+				-- It does NOT block "four shot" alone unless phone context exists.
+				for numberWord, digit in pairs(NUMBER_WORDS) do
+					if word == numberWord .. "shot"
+						or word == numberWord .. "shots"
+						or word == "shot" .. numberWord
+						or word == "shots" .. numberWord then
+						return digit
+					end
+				end
+
+				return nil
+			end
+
+			local previousTokenWasNumber = false
+			local previousNumberDigit = nil
+
+			for token in clean:gmatch("%S+") do
+				local tokenDigits = ""
+				local digit = wordToDigit(token)
+
+				if digit then
+					tokenDigits = digit
+					previousTokenWasNumber = true
+					previousNumberDigit = digit
+				elseif token == "shot" or token == "shots" then
+					-- "three shot" / "four shots"
+					if previousTokenWasNumber and previousNumberDigit then
+						-- Do not add another digit because the number word was already counted.
+						-- This line exists only to keep the coded context connected.
+						tokenDigits = ""
+					end
+
+					previousTokenWasNumber = false
+					previousNumberDigit = nil
+				elseif token:match("^%d+$") then
+					tokenDigits = token
+					previousTokenWasNumber = false
+					previousNumberDigit = nil
+				else
+					previousTokenWasNumber = false
+					previousNumberDigit = nil
+				end
+
+				if tokenDigits ~= "" then
+					for i = 1, #tokenDigits do
+						table.insert(digits, tokenDigits:sub(i, i))
+					end
+
+					currentRun = currentRun + #tokenDigits
+
+					if currentRun > longestRun then
+						longestRun = currentRun
+					end
+				elseif token == "shot" or token == "shots" then
+					-- Keep the run alive for phrases like "one shot two shot three shot"
+					currentRun = currentRun
+				else
+					currentRun = 0
+				end
+			end
+
+			return table.concat(digits, ""), longestRun
+		end
+
+		local function isShotCodeMessage(text)
+			local clean = normalizePhoneText(text)
+			local tokens = {}
+
+			for token in clean:gmatch("%S+") do
+				table.insert(tokens, token)
+			end
+
+			for _, token in ipairs(tokens) do
+				local word = tostring(token or ""):lower()
+				word = word:gsub("[^a-z0-9]", "")
+
+				for numberWord, _ in pairs(NUMBER_WORDS) do
+					if word == numberWord .. "shot"
+						or word == numberWord .. "shots"
+						or word == "shot" .. numberWord
+						or word == "shots" .. numberWord then
+						return true
+					end
+				end
+			end
+
+			for i = 1, #tokens - 1 do
+				local a = tokens[i]
+				local b = tokens[i + 1]
+
+				if NUMBER_WORDS[a] and (b == "shot" or b == "shots") then
+					return true
+				end
+
+				if (a == "shot" or a == "shots") and NUMBER_WORDS[b] then
+					return true
+				end
+			end
+
+			return false
+		end
+
+		-- Check the CURRENT message only, using recent messages only as context.
+		-- This fixes the bug where normal messages after a bypass kept getting blocked.
+		do
+			local currentOnly = recentMessages[#recentMessages] or currentMessage
+
+			local previousParts = {}
+			for i = math.max(1, #recentMessages - 8), #recentMessages - 1 do
+				table.insert(previousParts, recentMessages[i])
+			end
+
+			local previousContext = table.concat(previousParts, " ")
+
+			local currentDigits, currentLongestRun = extractPhoneDigitsFromText(currentOnly)
+			local currentHasDigits = currentDigits ~= ""
+			local currentIsShotCode = isShotCodeMessage(currentOnly)
+
+			local previousHasNormalPhoneContext = hasNormalPhoneContext(previousContext)
+			local currentHasNormalPhoneContext = hasNormalPhoneContext(currentOnly)
+
+			local previousHasShotContext = isCodedShotContext(previousContext)
+
+			-- CASE 1:
+			-- "so my numbers are the shots" is allowed,
+			-- but the next coded shot-number message is blocked.
+			if previousHasShotContext and currentIsShotCode then
+				return true, "pii_phone"
+			end
+
+			-- CASE 2:
+			-- Normal phone sharing:
+			-- "my num is" + "five four three two"
+			-- "call me" + "5432"
+			if currentHasDigits and (previousHasNormalPhoneContext or currentHasNormalPhoneContext) then
+				if currentLongestRun >= 4 then
+					return true, "pii_phone"
+				end
+
+				if #currentDigits >= 4 then
+					return true, "pii_phone"
+				end
+
+				-- If the user already created phone context, even one digit-word after it is suspicious.
+				if previousHasNormalPhoneContext then
+					return true, "pii_phone"
+				end
+			end
+		end
+	end
+
+	-- NEW: Catch split platform fragments across recent messages
+	-- Examples:
+	-- "dis" + "cord?" = discord
+	-- "in" + "sta??" = insta
+	-- "tik" + "tik??" = tiktik/tiktok bypass
+	do
+		local function cleanFragment(msg)
+			return normalizePlatformCompact(msg)
+		end
+
+		local function isShortFragment(msg)
+			local cleaned = cleanFragment(msg)
+			return cleaned ~= "" and #cleaned <= 12
+		end
+
+		-- Check only suffixes ending at the CURRENT message.
+		-- This prevents old bad messages from making a later normal message block.
+		for startIndex = #recentMessages, math.max(1, #recentMessages - 3), -1 do
+			local compact = ""
+			local allShort = true
+
+			for i = startIndex, #recentMessages do
+				local frag = cleanFragment(recentMessages[i])
+
+				if frag ~= "" then
+					compact ..= frag
+				end
+
+				if not isShortFragment(recentMessages[i]) then
+					allShort = false
+					break
+				end
+			end
+
+			if allShort and #compact >= 4 and #compact <= 24 then
+				local hit, platform = findPlatformAliasInCompact(compact, false)
+				if hit then
+					local recentText = table.concat(recentMessages, " ")
+
+					-- Do not block normal content talk like:
+					-- "that tiktok edit was funny"
+					-- "I saw a youtube video"
+					if not isPlatformContentConversation(recentText) then
+						return true, "contact_platform"
+					end
+				end
+			end
+		end
+	end
+
+	-- NEW: Catch acrostic / first-letter / last-letter bypasses
+	-- Example style: "a is a" / "g are g" / "e is elephant" -> spells "age"
+	do
+		local firstLetterTokens = {}
+		local lastTokenFirstLetterTokens = {}
+		local lastTokenEndLetterTokens = {}
+		local singleLetterTokens = {}
+		local clueCount = 0
+
+		local ACROSTIC_PII_KEYS = {
+			["age"] = "pii_age",
+			["old"] = "pii_age",
+			["dob"] = "pii_age",
+			["bday"] = "pii_age",
+			["birthday"] = "pii_age",
+			["birthdate"] = "pii_age",
+
+			["realname"] = "pii_real_name",
+			["fullname"] = "pii_real_name",
+			["name"] = "pii_real_name",
+
+			["phone"] = "pii_phone",
+			["number"] = "pii_phone",
+			["email"] = "pii_email",
+			["gmail"] = "contact_platform",
+			["address"] = "pii_address",
+			["location"] = "pii_location",
+		}
+
+		local function isSingleLetter(token)
+			return token and #token == 1 and token:match("^[a-z]$") ~= nil
+		end
+
+		local function normalizeAcrosticKey(text)
+			text = tostring(text or ""):lower()
+			text = text
+				:gsub("@", "a")
+				:gsub("4", "a")
+				:gsub("0", "o")
+				:gsub("1", "i")
+				:gsub("3", "e")
+				:gsub("5", "s")
+				:gsub("7", "t")
+			return text:gsub("[^a-z0-9]", "")
+		end
+
+		local function tokeniseMessage(msg)
+			local clean = tostring(msg or ""):lower()
+			clean = clean
+				:gsub("@", "a")
+				:gsub("4", "a")
+				:gsub("0", "o")
+				:gsub("1", "i")
+				:gsub("3", "e")
+				:gsub("5", "s")
+				:gsub("7", "t")
+				:gsub("[^a-z0-9]", " ")
+				:gsub("%s+", " ")
+
+			clean = clean:match("^%s*(.-)%s*$") or ""
+
+			local tokens = {}
+			for token in clean:gmatch("%S+") do
+				table.insert(tokens, token)
+			end
+
+			return tokens
+		end
+
+		local function looksLikeLetterClue(tokens)
+			if #tokens < 1 or #tokens > 5 then
+				return false
+			end
+
+			local first = tokens[1]
+			local last = tokens[#tokens]
+
+			local firstIsLetter = isSingleLetter(first)
+			local lastIsLetter = isSingleLetter(last)
+
+			local hasConnector = false
+			for _, token in ipairs(tokens) do
+				if token == "is"
+					or token == "are"
+					or token == "for"
+					or token == "means"
+					or token == "equals"
+					or token == "as" then
+					hasConnector = true
+					break
+				end
+			end
+
+			if firstIsLetter then
+				local sameAsLastStart = last:sub(1, 1) == first
+				local sameAsLastEnd = last:sub(#last, #last) == first
+
+				if hasConnector or sameAsLastStart or sameAsLastEnd or #tokens <= 2 then
+					return true
+				end
+			end
+
+			if lastIsLetter and #tokens <= 4 then
+				return true
+			end
+
+			return false
+		end
+
+		for _, msg in ipairs(recentMessages) do
+			local tokens = tokeniseMessage(msg)
+
+			if #tokens >= 1 and #tokens <= 5 then
+				local firstToken = tokens[1]
+				local lastToken = tokens[#tokens]
+
+				local firstLetter = firstToken:sub(1, 1)
+				local lastTokenFirstLetter = lastToken:sub(1, 1)
+				local lastTokenEndLetter = lastToken:sub(#lastToken, #lastToken)
+
+				if firstLetter:match("^[a-z]$") then
+					table.insert(firstLetterTokens, firstLetter)
+				end
+
+				if lastTokenFirstLetter:match("^[a-z]$") then
+					table.insert(lastTokenFirstLetterTokens, lastTokenFirstLetter)
+				end
+
+				if lastTokenEndLetter:match("^[a-z]$") then
+					table.insert(lastTokenEndLetterTokens, lastTokenEndLetter)
+				end
+
+				for _, token in ipairs(tokens) do
+					if isSingleLetter(token) then
+						table.insert(singleLetterTokens, token)
+					end
+				end
+
+				if looksLikeLetterClue(tokens) then
+					clueCount += 1
+				end
+			end
+		end
+
+		local function hasAcrosticContactContext()
+			local parts = {}
+
+			for _, msg in ipairs(recentMessages) do
+				table.insert(parts, tostring(msg or ""):lower())
+			end
+
+			local lower = table.concat(parts, " ")
+			local compact = lower
+				:gsub("@", "a")
+				:gsub("4", "a")
+				:gsub("0", "o")
+				:gsub("1", "i")
+				:gsub("3", "e")
+				:gsub("5", "s")
+				:gsub("7", "t")
+				:gsub("[^a-z0-9]", "")
+
+			return compact:find("watsur", 1, true)
+				or compact:find("whatsur", 1, true)
+				or compact:find("whatisur", 1, true)
+				or compact:find("watsyour", 1, true)
+				or compact:find("whatsyour", 1, true)
+				or compact:find("whatisyour", 1, true)
+				or compact:find("tellmeur", 1, true)
+				or compact:find("tellmeyour", 1, true)
+				or compact:find("givemeur", 1, true)
+				or compact:find("givemeyour", 1, true)
+				or compact:find("sendmeur", 1, true)
+				or compact:find("sendmeyour", 1, true)
+				or compact:find("addme", 1, true)
+				or compact:find("addmeon", 1, true)
+				or compact:find("dmme", 1, true)
+				or compact:find("followme", 1, true)
+				or compact:find("joinmy", 1, true)
+		end
+
+		local function checkJoinedSequence(letters)
+			if #letters < 2 then
+				return false, nil
+			end
+
+			local joined = table.concat(letters, "")
+			local joinedFuzzy = collapseRuns(joined)
+			local contactContext = hasAcrosticContactContext()
+
+			local function sequenceHas(word, allowShort)
+				local cleanWord = normalizeAcrosticKey(word)
+
+				if cleanWord == "" then
+					return false
+				end
+
+				if #cleanWord < 3 and not allowShort then
+					return false
+				end
+
+				if joined:find(cleanWord, 1, true) then
+					return true
+				end
+
+				if joinedFuzzy:find(cleanWord, 1, true) then
+					return true
+				end
+
+				return false
+			end
+
+			local function checkWordList(list, reason, allowShort)
+				if not list then
+					return false, nil
+				end
+
+				for k, v in pairs(list) do
+					local word
+
+					if type(k) == "number" then
+						word = v
+					else
+						word = k
+					end
+
+					if type(word) == "string" and sequenceHas(word, allowShort) then
+						return true, reason
+					end
+				end
+
+				return false, nil
+			end
+
+			local function checkShortPlatformAliases()
+				if not contactContext then
+					return false, nil
+				end
+
+				if clueCount < 1 then
+					return false, nil
+				end
+
+				local shortKeys = {
+					["dc"] = true, -- Discord
+					["yt"] = true, -- YouTube
+					["fb"] = true, -- Facebook
+					["ig"] = true, -- Instagram
+					["tt"] = true, -- TikTok
+					["sc"] = true, -- Snapchat
+					["wa"] = true, -- WhatsApp
+					["x"] = true,  -- X / Twitter
+				}
+
+				for key, _ in pairs(shortKeys) do
+					if sequenceHas(key, true) then
+						return true, "contact_platform"
+					end
+				end
+
+				return false, nil
+			end
+
+			local hit, reason
+
+			-- 1) Short contact aliases like dc / yt / ig / fb
+			hit, reason = checkShortPlatformAliases()
+			if hit then return true, reason end
+
+			-- 2) Existing dangerous / blocked lists
+			hit, reason = checkWordList(PROFANITY, "profanity", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(SELF_HARM, "self_harm", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(EXTREME, "extreme", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(HARASSMENT, "harassment", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(SEXUAL_ROOTS, "sexual_content", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(EXPLICIT_SLURS, "slur", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(HARD_SEXUAL_WORDS, "sexual_content", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(HARD_BLOCK_EXTREMIST_TERMS, "extremism", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(HARD_BLOCK_EXTREMIST_EXACT, "extremism", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(EXTREMIST_NAMES, "extremism", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(EXTREMIST_CALLS, "extremism", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(EXTREMIST_PEOPLE_STRICT, "extremism", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(EXTREMIST_ORGS_STRICT, "extremism", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(EXTREMIST_SLOGANS_STRICT, "extremism", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(SCAM_PATTERNS, "scam", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(ROBUX_VARIANTS, "scam", false)
+			if hit then return true, reason end
+
+			hit, reason = checkWordList(CONTACT_PHRASES, "contact_platform", false)
+			if hit then return true, reason end
+
+			-- 3) PII and off-platform acrostics need clue-looking messages
+			if clueCount >= 2 then
+				for word, piiReason in pairs(ACROSTIC_PII_KEYS) do
+					if sequenceHas(word, false) then
+						return true, piiReason
+					end
+				end
+
+				hit, reason = checkWordList(OFF_PLATFORM_KEYS, "contact_platform", false)
+				if hit then return true, reason end
+
+				hit, reason = checkWordList(CONTACT_PLATFORMS, "contact_platform", false)
+				if hit then return true, reason end
+
+				hit, reason = checkWordList(FOREIGN_PROFANITY, "foreign_profanity", false)
+				if hit then return true, reason end
+
+				hit, reason = checkWordList(LATIN_FOREIGN_PROFANITY, "foreign_profanity", false)
+				if hit then return true, reason end
+			end
+
+			return false, nil
+		end
+
+		local hit, reason = checkJoinedSequence(firstLetterTokens)
+		if hit then return true, reason end
+
+		hit, reason = checkJoinedSequence(lastTokenFirstLetterTokens)
+		if hit then return true, reason end
+
+		hit, reason = checkJoinedSequence(lastTokenEndLetterTokens)
+		if hit then return true, reason end
+
+		hit, reason = checkJoinedSequence(singleLetterTokens)
+		if hit then return true, reason end
+	end
+
+	-- ============================================================
+	-- EVERYTHING BELOW THIS LINE IS YOUR ORIGINAL LOGIC, UNCHANGED
+	-- ============================================================
+
+
+	local combined = tostring(currentMessage):lower()
+
+
+	if combined:match("%f[%a]meeting%f[%A]")
+		or combined:match("%f[%a]meetings%f[%A]") then
+		return false, nil
+	end
+
+	if isContentCreationPhrase(combined) then
+		return false, nil
+	end
+	local combinedLetters = removeAllNonLetters(combined)
+
+	if containsRealNameQuestionAdvanced(combined, combinedLetters) then
+		return true, "pii_real_name"
+	end
+
+	local combinedNoSpace = combined:gsub("%s+", "")
+	local combinedLettersNoSpace = combinedNoSpace:gsub("[^a-z]", "")
+	local combinedFuzzy = collapseRuns(combinedLettersNoSpace)
+
+	if combinedLetters:find("whatsyourrealname", 1, true)
+		or combinedLetters:find("whatsurrealname", 1, true)
+		or combinedFuzzy:find("whatsyourrealname", 1, true)
+		or combinedFuzzy:find("whatsurrealname", 1, true) then
+		return true, "pii_real_name"
+	end
+
+	local combinedNoSpaces = combined:gsub("%s+", "")
+	local combinedLettersOnly = combinedNoSpaces:gsub("[^%a]", "")
+
+	-- Only flag off-platform split words if there's actual contact intent in the combined message
+	-- Using hasContactIntent prevents false positives like "dis" + "cuss" = "discuss" → false discord match
+	do
+		if hasContactIntent(combined) then
+			return true, "contact_platform"
+		end
+	end
+
+	if containsSafePhrasePattern(combined) then
+		return false, nil
+	end
+
+	local trimmedCombined = combined:match("^%s*(.-)%s*$") or combined
+	local lowerCombined = combined:lower()
+
+	if isNormalConversationalSentence(combined, lowerCombined, trimmedCombined) then
+		return false, nil
+	end
+
+	if containsWhitelistedWord(combined, combined, combinedFuzzy) then
+		return false, nil
+	end
+
+	for _, word in ipairs(PROFANITY) do
+		if combinedLettersOnly:find(word, 1, true)
+			or combinedNoSpaces:find(word, 1, true)
+			or combinedFuzzy:find(word, 1, true) then
+			return true, "profanity"
+		end
+	end
+
+	for _, word in ipairs(SELF_HARM) do
+		if combinedLettersOnly:find(word, 1, true)
+			or combinedFuzzy:find(word, 1, true) then
+			return true, "self_harm"
+		end
+	end
+
+	for _, word in ipairs(HARASSMENT) do
+		if combinedLettersOnly:find(word, 1, true)
+			or combinedFuzzy:find(word, 1, true) then
+			return true, "harassment"
+		end
+	end
+
+	local extremeFigures = {
+		"diddy", "pdiddy", "seancombs",
+		"epstein", "ebstein", "ebstean", "epstean",
+		"jeffreyepstein", "hitler", "himmler",
+	}
+	for _, word in ipairs(extremeFigures) do
+		if combinedLettersOnly:find(word, 1, true)
+			or combinedFuzzy:find(word, 1, true) then
+			return true, "extreme"
+		end
+	end
+
+	local phonePatterns = {
+		"phonenumber","phonenum","whatsyourphonenumber",
+		"whatsyournumber","yournumber","urphonenumber"
+	}
+
+	for _, pattern in ipairs(phonePatterns) do
+		if combinedNoSpaces:find(pattern, 1, true) then
+			return true, "pii_phone_question"
+		end
+	end
+
+	return false, nil
+end
+
+local function hardBlockPII(raw)
+	if raw:match("^rbxassetid://") or raw:match("^rbxsatestid://") then
+		return true, nil
+	end
+
+	local lower = string.lower(raw)
+	if isContentCreationPhrase(lower) then
+		return true, nil
+	end
+	local trimmed = lower:match("^%s*(.-)%s*$") or lower
+	local digits = raw:gsub("%D", "")
+	local nospace = trimmed:gsub("%s+", "")
+	local lettersOnly = removeAllNonLetters(raw)
+
+	if containsRealNameQuestionAdvanced(lower, lettersOnly) then
+		return false, "pii_real_name"
+	end
+
+	local fuzzy = collapseRuns(removeAllNonLetters(raw))
+	lower = lower:gsub("%f[%a]wat%f[%A]", "what")
+
+	if containsRealNameQuestion(lower, fuzzy, nospace) then
+		return false, "pii_real_name"
+	end
+
+	for _, phrase in ipairs(SAFE_TAG_PHRASES) do
+		if matchesWholePhrase(trimmed, phrase)
+			or nospace == phrase:gsub("%s+", "") then
+			return true, nil
+		end
+	end
+
+	if containsSafePhrasePattern(raw) and not hasContactIntent(lower) then
+		return true, nil
+	end
+
+	if isNormalConversationalSentence(raw, lower, trimmed)
+		and not hasContactIntent(lower) then
+		return true, nil
+	end
+
+	if containsWhitelistedWord(raw, lower, "")
+		and not hasContactIntent(lower) then
+		return true, nil
+	end
+
+	local safeNamePhrases = {
+		"name tag", "name tags", "nametag", "nametags",
+		"family name", "family names", "familyname", "familynames",
+		"user name", "user names", "username", "usernames",
+		"display name", "display names", "displayname", "displaynames",
+		"character name", "character names", "charactername", "characternames",
+		"player name", "player names", "playername", "playernames",
+		"game name", "game names", "gamename", "gamenames",
+		"team name", "team names", "teamname", "teamnames",
+		"server name", "server names", "servername", "servernames",
+	}
+	for _, phrase in ipairs(safeNamePhrases) do
+		if matchesWholePhrase(lower, phrase) or nospace:find(phrase:gsub("%s+", ""), 1, true) then
+			return true, nil
+		end
+	end
+
+	if looksLikeImageUrl(raw) then return false, "contact_image_url" end
+	if lettersOnly == "name" or lettersOnly == "namee" or lettersOnly == "naame" then
+		if SAFE_TAG_PHRASES then
+			for _, phrase in ipairs(SAFE_TAG_PHRASES) do
+				if matchesWholePhrase(trimmed, phrase)
+					or nospace == phrase:gsub("%s+", "") then
+					return true, nil
+				end
+			end
+		end
+		return false, "pii_name"
+	end
+	if lettersOnly == "address" or lettersOnly == "adress" or lettersOnly == "addres" or lettersOnly == "adres" then
+		return false, "pii_address_phrase"
+	end
+	if trimmed == "name" or trimmed == "name?" then return false, "pii_name_short" end
+	if trimmed == "address?" or trimmed == "adress?" or trimmed == "adress" then return false, "pii_address_phrase_short" end
+	if matchesWholePhrase(trimmed, "ur name") or matchesWholePhrase(trimmed, "your name")
+		or matchesWholePhrase(trimmed, "what is your name") or matchesWholePhrase(trimmed, "what's your name")
+		or matchesWholePhrase(trimmed, "whats your name") or matchesWholePhrase(nospace, "whatisyourname")
+		or matchesWholePhrase(nospace, "whatsyourname") or matchesWholePhrase(trimmed, "my name")
+		or matchesWholePhrase(trimmed, "name is") or matchesWholePhrase(trimmed, "real name")
+		or matchesWholePhrase(trimmed, "firstname") or matchesWholePhrase(trimmed, "last name")
+		or matchesWholePhrase(trimmed, "that's my name") or matchesWholePhrase(trimmed, "thats my name")
+		or matchesWholePhrase(nospace, "thatsmyname") then
+		return false, "pii_name"
+	end
+	if lettersOnly == "whatisyourname" or lettersOnly == "whatsyourname" or lettersOnly == "whatyourname"
+		or lettersOnly == "yourname" or lettersOnly == "whatname" or lettersOnly == "myname" then
+		return false, "pii_name"
+	end
+	do
+		local nameWord = trimmed:match("i[%s']*m%s+([%a]+)") or trimmed:match("i%s+am%s+([%a]+)")
+		if nameWord then
+			if BENIGN_RAPE_WORDS_EXACT[nameWord] then
+				return true, nil
+			end
+			if COMMON_RESPONSE_WORDS[nameWord] then
+				return true, nil
+			end
+			local doingPattern = trimmed:match("i[%s']*m%s+doing%s+([%a]+)") or trimmed:match("i%s+am%s+doing%s+([%a]+)")
+			if doingPattern and COMMON_RESPONSE_WORDS[doingPattern] then
+				return true, nil
+			end
+			local feelingPattern = trimmed:match("i[%s']*m%s+feeling%s+([%a]+)") or trimmed:match("i%s+am%s+feeling%s+([%a]+)")
+			if feelingPattern and COMMON_RESPONSE_WORDS[feelingPattern] then
+				return true, nil
+			end
+			local verbPattern = trimmed:match("i[%s']*m%s+([%a]+)%s+") or trimmed:match("i%s+am%s+([%a]+)%s+")
+			if verbPattern and BENIGN_RAPE_WORDS_EXACT[verbPattern] then
+				return true, nil
+			end
+			if looksLikeNameWord(nameWord) then
+				if trimmed:match("^i[%s']*m%s+" .. nameWord .. "%s*$") then
+					return false, "pii_name_iam"
+				end
+			end
+		end
+	end
+	if not isSafeGameQuestion(raw) then
+		if matchesWholePhrase(trimmed, "where do you live")
+			or matchesWholePhrase(trimmed, "where you live")
+			or matchesWholePhrase(nospace, "wheredoyoulive") then
+			return false, "pii_address_phrase"
+		end
+	end
+	if matchesWholePhrase(trimmed, "what is your address") or matchesWholePhrase(trimmed, "what's your address")
+		or matchesWholePhrase(trimmed, "whats your address") or matchesWholePhrase(trimmed, "your address")
+
+		or (not isSafeGameQuestion(raw)
+			and not lower:find(" in game", 1, true)
+			and not lower:find(" in the game", 1, true)
+			and not lower:find(" in roblox", 1, true)
+			and matchesWholePhrase(nospace, "wheredoyoulive"))
+		or matchesWholePhrase(nospace, "whatisyouraddress")
+		or matchesWholePhrase(nospace, "whatsyouraddress") or matchesWholePhrase(trimmed, "my address")
+		or matchesWholePhrase(trimmed, "my adress") or matchesWholePhrase(trimmed, "i live at")
+		or matchesWholePhrase(trimmed, "i live in") or matchesWholePhrase(trimmed, "live at")
+		or matchesWholePhrase(trimmed, "live in") or matchesWholePhrase(trimmed, "that's my address")
+		or matchesWholePhrase(trimmed, "thats my address") or matchesWholePhrase(trimmed, "house number")
+		or matchesWholePhrase(trimmed, "apt") or matchesWholePhrase(trimmed, "apartment")
+		or matchesWholePhrase(trimmed, "flat") or matchesWholePhrase(trimmed, "street")
+		or matchesWholePhrase(trimmed, " st ") or matchesWholePhrase(trimmed, " rd ") or matchesWholePhrase(trimmed, "road")
+		or matchesWholePhrase(trimmed, "avenue") or matchesWholePhrase(trimmed, " ave ") or matchesWholePhrase(trimmed, "lane")
+		or matchesWholePhrase(trimmed, " ln ") or matchesWholePhrase(trimmed, "blvd") or matchesWholePhrase(trimmed, "boulevard")
+		or matchesWholePhrase(trimmed, "zip code") or matchesWholePhrase(trimmed, "zipcode") or matchesWholePhrase(trimmed, "postcode")
+		or matchesWholePhrase(trimmed, "po box") or matchesWholePhrase(trimmed, "p.o. box") then
+		return false, "pii_address_phrase"
+	end
+	if lettersOnly == "whatisyouraddress" or lettersOnly == "whatsyouraddress" or lettersOnly == "youraddress"
+		or lettersOnly == "myaddress" or lettersOnly == "wheredoyoulive" or lettersOnly == "whereyoulive" then
+		return false, "pii_address_phrase"
+	end
+	if #digits >= 1 and (matchesWholePhrase(trimmed, "street") or matchesWholePhrase(trimmed, " st ")
+		or matchesWholePhrase(trimmed, " rd ") or matchesWholePhrase(trimmed, "road")
+		or matchesWholePhrase(trimmed, "avenue") or matchesWholePhrase(trimmed, " ave ")
+		or matchesWholePhrase(trimmed, "lane") or matchesWholePhrase(trimmed, " ln ")
+		or matchesWholePhrase(trimmed, "blvd") or matchesWholePhrase(trimmed, "boulevard")) then
+		return false, "pii_address_pattern"
+	end
+	if trimmed:match("[%w%._%-]+@[%w%-]+%.[%a%.][%a%.]+") then return false, "pii_email" end
+	if matchesWholePhrase(trimmed, "email me") or matchesWholePhrase(trimmed, "my email")
+		or matchesWholePhrase(trimmed, "e%-mail me") or matchesWholePhrase(trimmed, "that's my email")
+		or matchesWholePhrase(trimmed, "thats my email") or matchesWholePhrase(trimmed, "gmail")
+		or matchesWholePhrase(trimmed, "hotmail") or matchesWholePhrase(trimmed, "outlook")
+		or matchesWholePhrase(trimmed, "protonmail") or matchesWholePhrase(trimmed, "yahoo mail") then
+		return false, "pii_email_phrase"
+	end
+	if matchesWholePhrase(trimmed, "what is your phone number") or matchesWholePhrase(trimmed, "what's your phone number")
+		or matchesWholePhrase(trimmed, "whats your phone number") or matchesWholePhrase(trimmed, "what is your phone")
+		or matchesWholePhrase(trimmed, "what's your phone") or matchesWholePhrase(trimmed, "whats your phone")
+		or matchesWholePhrase(trimmed, "what is your number") or matchesWholePhrase(trimmed, "what's your number")
+		or matchesWholePhrase(trimmed, "whats your number") or matchesWholePhrase(trimmed, "your phone number")
+		or matchesWholePhrase(trimmed, "ur phone number") or matchesWholePhrase(trimmed, "your phone")
+		or matchesWholePhrase(trimmed, "ur phone") or matchesWholePhrase(trimmed, "your number")
+		or matchesWholePhrase(trimmed, "ur number") or matchesWholePhrase(trimmed, "phone number")
+		or matchesWholePhrase(trimmed, "phone number?") or matchesWholePhrase(trimmed, "number?")
+		or matchesWholePhrase(trimmed, "phone num") or matchesWholePhrase(trimmed, "phone num?")
+		or matchesWholePhrase(trimmed, "ur phone num") or matchesWholePhrase(trimmed, "ur phone num?")
+		or matchesWholePhrase(trimmed, "your phone num") or matchesWholePhrase(trimmed, "your phone num?")
+		or matchesWholePhrase(nospace, "whatisyourphonenumber") or matchesWholePhrase(nospace, "whatsyourphonenumber")
+		or matchesWholePhrase(nospace, "whatisyournumber") or matchesWholePhrase(nospace, "whatsyournumber")
+		or matchesWholePhrase(nospace, "yourphonenumber") or matchesWholePhrase(nospace, "urphonenumber")
+		or matchesWholePhrase(nospace, "yournumber") or matchesWholePhrase(nospace, "urnumber")
+		or matchesWholePhrase(nospace, "phonenum") or matchesWholePhrase(nospace, "phonenum?") then
+		return false, "pii_phone_question"
+	end
+	if #digits >= 7 then return false, "pii_big_number" end
+	if #digits >= 3 and (matchesWholePhrase(trimmed, "phone") or matchesWholePhrase(trimmed, "number")
+		or matchesWholePhrase(trimmed, "call me") or matchesWholePhrase(trimmed, "text me")
+		or matchesWholePhrase(trimmed, "whatsapp") or matchesWholePhrase(trimmed, "snap")
+		or matchesWholePhrase(trimmed, "contact me") or matchesWholePhrase(trimmed, "my number")
+		or matchesWholePhrase(trimmed, "that's my number") or matchesWholePhrase(trimmed, "thats my number")) then
+		return false, "pii_phone"
+	end
+	return true, nil
+end
+
+local function containsSexualContent(lower, fuzzy)
+	local joined = lower:gsub("[^a-z]", "")
+	if BENIGN_SEX_SUBSTRINGS[joined] then
+		return false
+	end
+	if joined:match("c+o+o+m+") then
+		return true
+	end
+	for _, root in ipairs(SEXUAL_ROOTS) do
+		local e = root:gsub("[%(%)%.%+%-%*%?%[%]%^%$%%]", "%%%0")
+		if joined:match("%f[%a]" .. e .. "%f[%A]")
+			or joined:match("^" .. e .. "$")
+			or lower:match("%f[%a]" .. e .. "%f[%A]") then
+			return true
+		end
+	end
+	return false
+end
+
+-- FIX: scanTokensForBlockedContent — "ballcleaner" should be caught here
+local function scanTokensForBlockedContent(text)
+	local lower = text:lower()
+
+	do
+		local joined = lower:gsub("[^a-z]", "")
+		if BENIGN_SEX_SUBSTRINGS[joined] then
+			return false, nil
+		end
+	end
+
+	local joinedLetters = lower:gsub("[^a-z]", "")
+	local joinedFuzzy = collapseRuns(joinedLetters)
+
+	for _, w in ipairs(HARD_SEXUAL_WORDS) do
+		if joinedLetters:find(w, 1, true)
+			or joinedFuzzy:find(w, 1, true) then
+			return true, "sexual_content"
+		end
+	end
+
+	for _, root in ipairs(SEXUAL_ROOTS) do
+		local e = root:gsub("[%(%)%.%+%-%*%?%[%]%^%$%%]", "%%%0")
+		if joinedLetters:match("%f[%a]" .. e .. "%f[%A]")
+			or joinedLetters == root
+			or joinedFuzzy:match("%f[%a]" .. e .. "%f[%A]") then
+			return true, "sexual_content"
+		end
+	end
+
+	-- FIX: Catch "ballcleaner" and similar nonsense sexual compounds
+	if joinedLetters:find("ballcleaner", 1, true)
+		or joinedLetters:find("ballwasher", 1, true)
+		or joinedFuzzy:find("ballcleaner", 1, true) then
+		return true, "sexual_content"
+	end
+
+	if lower:match("%f[%a]ss%s+rank%f[%A]")
+		or lower:match("%f[%a]ss%s+skin%f[%A]")
+		or lower:match("%f[%a]ss%s+car%s+skin%f[%A]")
+		or lower:match("%f[%a]s%s+score%f[%A]") then
+		return false, nil
+	end
+
+	for token in text:gmatch("%w+") do
+		local t = token:lower()
+		local fuzzy = collapseRuns(t)
+
+		if containsSexualContent(t, fuzzy) then
+			return true, "sexual_content"
+		end
+
+		for _, bad in ipairs(PROFANITY) do
+			if fuzzy == bad then
+				return true, "profanity"
+			end
+		end
+	end
+
+	return false, nil
+end
+
+local function looksLikeKeyboardMash(text)
+	local trimmed = text:match("^%s*(.-)%s*$") or text
+	if trimmed:find("%s") then return false end
+	local len = #trimmed
+	if len < 7 then return false end
+	local lower = trimmed:lower()
+	local letters = lower:gsub("[^a-z]", "")
+	local digits = trimmed:gsub("[^0-9]", "")
+	-- Mixed letters + digits in one token = always spam
+	if #letters >= 4 and #digits >= 2 and len >= 8 then
+		return true
+	end
+	-- Pure letter mash checks
+	if #letters >= 8 and #digits == 0 then
+		local vowels = 0
+		for i = 1, #letters do
+			local ch = letters:sub(i, i)
+			if ch=="a" or ch=="e" or ch=="i" or ch=="o" or ch=="u" then
+				vowels = vowels + 1
+			end
+		end
+		local ratio = vowels / #letters
+		-- q not followed by u = keyboard mash
+		if (lower:find("q[^u]") or lower:sub(-1) == "q") and ratio < 0.35 then
+			return true
+		end
+		-- Extremely low vowel ratio in long strings
+		if ratio < 0.15 and #letters >= 10 then
+			return true
+		end
+		-- Multiple unusual letter pairs
+		local unusualBigrams = {"qw","wq","qd","dq","qs","sq","qz","zq","xw","wx"}
+		local unusualCount = 0
+		for _, bg in ipairs(unusualBigrams) do
+			local _, n = lower:gsub(bg, "")
+			unusualCount = unusualCount + n
+		end
+		if unusualCount >= 2 then
+			return true
+		end
+	end
+	return false
+end
+
+local function isEZToxic(trimmed)
+	return trimmed:match("^e+z+$")
+		or trimmed:match("^z+z+z+$")
+		or trimmed:match("^ez+z*$")
+end
+
+local function containsG00nVariant(text)
+	local lower = text:lower()
+	if lower:match("%f[%w]g00n%f[%W]") then
+		return true
+	end
+	if lower:match("%f[%w]g%s+0%s+0%s+n%f[%W]") then
+		return true
+	end
+	return false
+end
+
+local function isNormalGameNumberSentence(text)
+	local lower = text:lower()
+	local patterns = {
+		"score %d+", "room %d+", "points %d+",
+		"got %d+", "level %d+", "wave %d+", "round %d+",
+	}
+	for _, p in ipairs(patterns) do
+		if lower:match(p) then
+			return true
+		end
+	end
+	return false
+end
+
+local function analyseMessage(raw)
+	if containsG00nVariant(raw) then
+		return true, {"sexual_content"}
+	end
+
+	local lowerRaw = string.lower(raw)
+
+	do
+		local phrase = lowerRaw:gsub("[%p]", " "):gsub("%s+", " ")
+		if phrase:match("%f[%a]go%s+on%f[%A]") then
+			return false, {}
+		end
+	end
+
+	local SS_GAMING_PATTERNS = {
+		"%f[%a]ss%s+rank%f[%A]",
+		"%f[%a]i%s+got%s+an%s+ss%s+rank%f[%A]",
+		"%f[%a]s%s+score%f[%A]",
+		"%f[%a]i%s+got%s+an%s+s%s+score%f[%A]",
+		"%f[%a]ss%s+skin%f[%A]",
+		"%f[%a]nice%s+ss%s+skin%f[%A]",
+		"%f[%a]ss%s+car%s+skin%f[%A]",
+		"%f[%a]this%s+game%s+has%s+a%s+cool%s+ss%s+car%s+skin%f[%A]",
+	}
+
+	local isSSGamingContext = false
+	for _, pat in ipairs(SS_GAMING_PATTERNS) do
+		if lowerRaw:match(pat) then
+			isSSGamingContext = true
+			break
+		end
+	end
+
+	raw = raw:match("^%s*(.-)%s*$") or raw
+
+	local lowerRaw2 = string.lower(raw)
+
+	local SS_ALLOWLIST = {
+		"my ss rank is crazy",
+		"this game has a cool ss car skin",
+		"this game has a cool ss skin",
+		"cool ss car skin",
+		"my new ss skin looks cool"
+	}
+
+	for _, safe in ipairs(SS_ALLOWLIST) do
+		if lowerRaw2 == safe then
+			return false, {}
+		end
+	end
+
+	if lowerRaw2:match("%f[%a]ss%s+car%s+skin%f[%A]")
+		or lowerRaw2:match("%f[%a]ss%s+skin%f[%A]") then
+		return false, {}
+	end
+
+	if lowerRaw2:match("%f[%a]ss%s+rank%f[%A]")
+		or lowerRaw2:match("%f[%a]ssrank%f[%A]")
+		or lowerRaw2:match("%f[%a]s%s*rank%f[%A]") then
+		return false, {}
+	end
+
+	local reasons = {}
+	local blocked = false
+
+	local function flag(reason)
+		blocked = true
+		table.insert(reasons, reason)
+	end
+
+	local messageLength = #raw
+	raw = raw:match("^%s*(.-)%s*$") or raw
+	local lower, norm, fuzzy = makeFuzzy(raw)
+
+	-- FIX: normalize "wat" -> "what" (dropped-h bypass: "wat's ur age", "wat is ur name")
+	lower = lower:gsub("%f[%a]wat%f[%A]", "what")
+	fuzzy = collapseRuns(lower:gsub("[^%w]", ""))
+
+	if isNormalGameNumberSentence(raw) then
+		return false, {}
+	end
+
+	local collapsedLower = collapseRuns(lower:gsub("[^a-z]", ""))
+	local trimmed = lower:match("^%s*(.-)%s*$") or lower
+
+	local tokenHit, tokenReason = scanTokensForBlockedContent(raw)
+	if tokenHit then
+		return true, { tokenReason }
+	end
+
+	do
+		local lower2 = raw:lower()
+
+		local allowlist = {
+			"don't touch that button",
+			"touch grass",
+			"smooth touch",
+			"title screen is loading",
+			"shooting mechanics",
+			"public places are crowded",
+			"gun skins",
+			"cigarette smoke effect",
+			"smoking animation",
+			"this is a calculator",
+			"i like cake",
+			"hiking is fun",
+			"gun range in a game",
+			-- FIX: allow common app mentions without contact intent
+			"normal apps are okay",
+			"normal apps are fine",
+			"apps are okay",
+			"apps are fine",
+		}
+
+		for _, safe in ipairs(allowlist) do
+			if lower2:find(safe, 1, true) then
+				return false, {}
+			end
+		end
+
+		local joined = collapseRuns(lower2:gsub("[^a-z]", ""))
+		-- Also apply special char normalization to joined
+		local joinedNorm = joined
+			:gsub("|", "i"):gsub("§", "s"):gsub("!", "i"):gsub("@", "a")
+
+		local sexualPhrases = {
+			"lemmetouchem", "itouchu", "itouchyou", "itouchkids", "getfreakyonme",
+			"getfreaky", "goingtogetfreaky", "letsgetfreaky",
+			-- lick my balls variants
+			"lickmybals", "lickmyballs", "lickmybal", "lickmydik", "lickmydick", "lickmydih",
+			-- suk my dih variants
+			"sukmydih", "sukmydick", "sukmydik", "suckmydih",
+			"iluvsukindih", "iluvsukin", "sukindih",
+			-- show me your X
+			"showmeyourkahoonas", "showmeyourkahunas", "showmeyourprivate",
+			"showurprivate", "showurkahoon",
+			-- touch private
+			"touchmyprivate", "touchurprivate", "touchyourprivate",
+			"touchmeprivate", "touchprivatepart",
+			-- my X better than you (sexual body part bragging)
+			"mydihbeter", "mydihbetter", "mydickbetter",
+		}
+
+		for _, p in ipairs(sexualPhrases) do
+			if joinedNorm:find(p, 1, true) then
+				return true, { "sexual_content" }
+			end
+		end
+
+		local threatPhrases = {
+			"shootapublicplace",
+			"imonnashootapublicplace",
+			"isgonnashootapublicplace",
+			"gonashootapublicplace",
+			"iwillputaguninyourhead",
+			"putaguninyourhead",
+			"iwanttoshoota",
+			-- keelyoself = kill yourself (both collapsed and non-collapsed)
+			"keelyoself", "kelyoself",
+			"keelurself", "kelurself",
+			"keelyourself", "kelyourself",
+			"killyoself", "kilyoself",
+			"killurself", "kilurself",
+		}
+
+		-- Check both collapsed (joinedNorm) AND the raw stripped lower2 for self-harm phrases
+		-- This is critical because collapseRuns("keelyoself") = "kelyoself" which doesn't match "keelyoself"
+		local lower2stripped = lower2:gsub("[^a-z]", "")
+		for _, p in ipairs(threatPhrases) do
+			if joinedNorm:find(p, 1, true) or lower2stripped:find(p, 1, true) then
+				return true, { "threat" }
+			end
+		end
+
+		local racistDehumanizingPhrases = {
+			"blackmonkey", "brownmonkey", "blackape", "blackgorilla",
+			"fatblackmonkey",
+		}
+		for _, p in ipairs(racistDehumanizingPhrases) do
+			if joinedNorm:find(p, 1, true) then
+				return true, { "hate_violence" }
+			end
+		end
+
+		local drugPhrases = {
+			"smokecigs", "smokesomecigs", "smokecig",
+			"smokewithme", "smokecigarete", "smokeacigarette",
+			"smokeabowl", "smokeweed", "doingdrugs",
+		}
+
+		for _, p in ipairs(drugPhrases) do
+			if joinedNorm:find(p, 1, true) then
+				return true, { "drug_reference" }
+			end
+		end
+
+		-- PII phrase: "my full name is", "my card details"
+		if joinedNorm:find("myfullnameis", 1, true)
+			or joinedNorm:find("mycarddetails", 1, true)
+			or joinedNorm:find("mycardnumber", 1, true)
+			or joinedNorm:find("mycreditcard", 1, true) then
+			return true, { "pii_name" }
+		end
+	end
+
+	if looksLikeKeyboardMash(raw) then
+		return true, { "toxic_spam" }
+	end
+
+	if isEZToxic(trimmed) then
+		return true, { "toxic_spam" }
+	end
+
+	if containsFreeRobuxScam(lower, fuzzy) then
+		return true, { "scam" }
+	end
+
+	if containsLatinForeignProfanity(lower, fuzzy) then
+		return true, { "profanity" }
+	end
+
+	local digitsOnly = norm:gsub("%D", "")
+	local lettersOnly = lower:gsub("[^a-z]", "")
+
+	if isImVerbSentence(trimmed) then
+		return false, reasons
+	end
+	local lettersOnlyFromRaw = raw:gsub("[^%a]", ""):lower()
+	local aggressiveLettersOnly = removeAllNonLetters(raw)
+
+	if isCommonGreetingVariation(raw, lower, trimmed) then
+		return false, reasons
+	end
+
+	if lower:match("%f[%a]meeting%f[%A]")
+		or lower:match("%f[%a]meetings%f[%A]")
+		or lower:match("%f[%a]freeze%f[%A]")
+		or lower:match("%f[%a]freezing%f[%A]")
+		or lower:match("%f[%a]froze%f[%A]")
+		or lower:match("%f[%a]frozen%f[%A]") then
+		return false, {}
+	end
+
+	if trimmed == "meeting" or trimmed == "meetings" then
+		return false, reasons
+	end
+
+	for word, _ in pairs(ALWAYS_BLOCK_WORDS) do
+		if matchesWholePhrase(lower, word) then
+			return true, { "profanity" }
+		end
+	end
+
+	if containsSafePhrasePattern(raw) and not hasContactIntent(lower) then
+		return false, reasons
+	end
+
+	local joined = lower:gsub("[^a-z]", "")
+
+	if joined:match("c+a+l+l+m+e+")
+		or joined:match("d+m+m+e+") then
+		return true, { "contact_phrase" }
+	end
+
+	if joined:find("n+i+g+g+") and not joined:find("snigger") then
+		return true, { "profanity" }
+	end
+
+	if isNormalConversationalSentence(raw, lower, trimmed)
+		and not hasContactIntent(lower) then
+		return false, {}
+	end
+
+	if containsWhitelistedWord(raw, lower, "")
+		and not hasContactIntent(lower) then
+		return false, {}
+	end
+
+	if isContentCreationPhrase(lower) then
+		return false, reasons
+	end
+	if looksLikeImageUrl(raw) then table.insert(reasons, "contact_image_url"); blocked = true end
+	if hasExcessiveRepeats(raw) then table.insert(reasons, "excessive_repeats"); blocked = true end
+	if SAFE_EXACT_MESSAGE[trimmed] then return false, reasons end
+	if BENIGN_RAPE_WORDS_EXACT[trimmed] then return false, reasons end
+
+	if BLOCKED_STANDALONE_WORDS[trimmed] then
+		table.insert(reasons, "profanity")
+		return true, reasons
+	end
+
+	if lettersOnlyFromRaw == "mommy" or lettersOnlyFromRaw == "momy" or lettersOnlyFromRaw == "daddy" or lettersOnlyFromRaw == "dady" then
+		flag("profanity")
+		return blocked, reasons
+	end
+	if containsCringe(lower, fuzzy) then flag("cringe") end
+	if not isEnglishOnly(raw) then flag("non_english") end
+	if #fuzzy == 1 then flag("single_letter") end
+	if digitsOnly ~= "" and digitsOnly == fuzzy then flag("number_only") end
+	if isRandomAlnumToken(fuzzy, lettersOnly, digitsOnly, messageLength) then flag("alnum_random") end
+	if lettersOnly == fuzzy and not trimmed:find("%s") then
+		local safeTerm = lower:gsub("[^a-z]", "")
+
+		if safeTerm ~= "lgbt"
+			and safeTerm ~= "lgbtq"
+			and safeTerm ~= "lgbtqia"
+			and safeTerm ~= "lgbtqiaa" then
+
+			if looksLikeLetterGibberish(trimmed, messageLength) then
+				flag("gibberish_letters")
+			end
+		end
+	end
+
+	do
+		local joinedForSlur = collapseRuns(lower:gsub("[^a-z]", ""))
+		for _, slur in ipairs(EXPLICIT_SLURS) do
+			local s = slur:gsub("%s+", "")
+			if joinedForSlur:find(s, 1, true) then
+				flag("profanity")
+				break
+			end
+		end
+	end
+
+	do
+		local joinedForCondo = collapseRuns(lower:gsub("[^a-z]", ""))
+		if joinedForCondo:find("condo", 1, true)
+			or joinedForCondo:find("condom", 1, true) then
+			flag("profanity")
+		end
+	end
+
+	local hasWhitelistedWord = containsWhitelistedWord(raw, lower, fuzzy)
+
+	-- ✅ Always check standalone blocked words, regardless of whitelisted-word status
+	for ngaPattern, _ in pairs(BLOCKED_STANDALONE_WORDS) do
+		if matchesWholePhrase(lower, ngaPattern)
+			or containsSpacedStandaloneWord(lower, ngaPattern) then
+			flag("profanity")
+			break
+		end
+	end
+
+	if hasWhitelistedWord then
+		for _, profanityWord in ipairs(PROFANITY) do
+			if matchesWholePhrase(lower, profanityWord) then
+				flag("profanity")
+				break
+			end
+		end
+
+		for _, root in ipairs(SLUR_ROOTS) do
+			local isPartOfWhitelisted = false
+			for whitelistedWord, _ in pairs(BENIGN_NIG_WORDS_EXACT) do
+				if matchesWholePhrase(lower, whitelistedWord) or lower:find(whitelistedWord, 1, true) then
+					isPartOfWhitelisted = true
+					break
+				end
+			end
+			if not isPartOfWhitelisted then
+				if matchesWholePhrase(lower, root) then
+					flag("profanity")
+					break
+				end
+			end
+		end
+
+		for _, bad in ipairs(FOREIGN_PROFANITY) do
+			if matchesWholePhrase(lower, bad) then
+				flag("profanity")
+				break
+			end
+		end
+
+		do
+			local joinedSpanish = collapseRuns(lower:gsub("[^a-záéíóúñ]", ""))
+			local spanishRoots = {
+				"put", "cabron", "pendej", "ching", "verg", "huev",
+				"maric", "zorr", "culi", "coñ", "caraj", "gilip",
+			}
+			for _, root in ipairs(spanishRoots) do
+				if joinedSpanish:find(root, 1, true) then
+					flag("profanity")
+					break
+				end
+			end
+		end
+
+		if not isSafeFinishPhrase(lower, fuzzy) then
+			if matchesWholePhrase(lower, "shit") or matchesWholePhrase(lower, "sh1t") or matchesWholePhrase(lower, "sht") then
+				flag("profanity_shit")
+			end
+		end
+
+		if matchesWholePhrase(lower, "deadass") or matchesWholePhrase(lower, "dead ass") 
+			or matchesWholePhrase(lower, "dedass") or matchesWholePhrase(lower, "ded ass") then
+			flag("profanity")
+		end
+
+		if matchesWholePhrase(lower, "cornball") or matchesWholePhrase(lower, "corn ball") then
+			flag("harassment")
+		end
+	else
+		local hit, word = containsAny(fuzzy, PROFANITY)
+		if hit then flag("profanity") end
+		if not blocked then
+			hit, word = containsAny(lower, PROFANITY)
+			if hit then flag("profanity") end
+		end
+
+		-- FIX: Only block short "pak" if it's standalone (prevent false hits on "package", "pakistan" etc.)
+		if lower:match("%f[%a]pak%f[%A]") and #lower <= 5 then
+			flag("harassment")
+		end
+
+		-- FIX: SLUR_ROOTS now only has longer roots (nigg, nlg etc.) — no ultra-short false-positive roots
+		for _, root in ipairs(SLUR_ROOTS) do
+			if #fuzzy >= 3 and fuzzy:find(root, 1, true) then
+				flag("profanity")
+				break
+			end
+		end
+
+		if lower:find("deadass", 1, true) or lower:find("dead ass", 1, true) or lower:find("dedass", 1, true) 
+			or lower:find("ded ass", 1, true) or fuzzy:find("deadass", 1, true) then
+			flag("profanity")
+		end
+
+		if lower:find("cornball", 1, true) or fuzzy:find("cornball", 1, true) 
+			or lower:find("corn ball", 1, true) then
+			flag("harassment")
+		end
+
+		for _, bad in ipairs(FOREIGN_PROFANITY) do
+			if lower:find(bad, 1, true) or fuzzy:find(bad, 1, true) then
+				flag("profanity")
+				break
+			end
+		end
+		if not isSafeFinishPhrase(lower, fuzzy) then
+			if fuzzy:find("shit", 1, true) or fuzzy:find("sh1t", 1, true) or fuzzy:find("sht", 1, true) then
+				flag("profanity_shit")
+			end
+		end
+	end
+	local hit = containsAny(fuzzy, SELF_HARM)
+	if hit then flag("self_harm") end
+	hit = containsAny(fuzzy, EXTREME)
+	if hit then flag("extreme") end
+	local function containsThreatPatterns(lower2, fuzzy2)
+		local threatPatterns = {
+			"killu", "kilu", "killyou", "killyu", "killur", "kilur",
+			"hurtyou", "hurtyu", "hurtu", "beatyour", "beatu", "beatyourass",
+			"fuckyour", "fucku", "fuckur", "attackyou", "attaku", "attacku",
+			"murderyou", "murderu", "stabyou", "stabu", "shootyou", "shootu",
+		}
+		for _, pattern in ipairs(threatPatterns) do
+			if fuzzy2:find(pattern, 1, true) or lower2:find(pattern, 1, true) then return true end
+		end
+		if lower2:find("i will kill you", 1, true) or lower2:find("i'll kill you", 1, true)
+			or lower2:find("im gonna kill you", 1, true) or lower2:find("i will hurt you", 1, true)
+			or lower2:find("i will beat you", 1, true) or lower2:find("i will fight you", 1, true)
+			or lower2:find("i will attack you", 1, true) or lower2:find("i will murder you", 1, true)
+			or lower2:find("kill yourself", 1, true) or lower2:find("kill your self", 1, true)
+			or lower2:find("kys", 1, true) then return true end
+		if lower2:find("im going to kill you", 1, true) or lower2:find("i'm going to kill you", 1, true)
+			or lower2:find("going to kill you", 1, true) or lower2:find("gonna kill you", 1, true) then return true end
+		return false
+	end
+
+	if containsThreatPatterns(lower, fuzzy) then flag("threat") end
+	if lettersOnly == "hell" or lettersOnly == "hel" then flag("extreme_hell_word") end
+
+	local nospace = trimmed:gsub("%s+", "")
+	for _, phrase in ipairs(SAFE_TAG_PHRASES) do
+		if matchesWholePhrase(trimmed, phrase)
+			or nospace == phrase:gsub("%s+", "") then
+			return blocked, reasons
+		end
+	end
+
+	if looksLikeOffPlatformPath(raw) then
+		return true, { "contact_platform" }
+	end
+
+	-- FIX: color-coded app bypass detection in analyseMessage
+	do
+		local colorHit, colorPlatform = detectColorCodedApp(lower)
+		if colorHit then
+			return true, { "contact_platform" }
+		end
+	end
+
+	if isNormalConversationalSentence(raw, lower, trimmed) then
+		return false, reasons
+	elseif not hasWhitelistedWord then
+		-- Only flag contact platform if hasContactIntent confirms actual solicitation intent
+		-- (hasContactIntent now allows casual platform mentions like "have you seen that YouTube video")
+		if hasContactIntent(lower) then
+			flag("contact_platform")
+		end
+		hit = containsAny(fuzzy, CONTACT_PHRASES)
+		if hit then flag("contact_phrase") end
+		if looksLikeUrl(lower) then flag("contact_url") end
+	end
+
+	if matchesWholePhrase(lower, "how old are ya") or matchesWholePhrase(lower, "how old r ya")
+		or matchesWholePhrase(lower, "how old are u") or matchesWholePhrase(lower, "how old r u")
+		or matchesWholePhrase(lower, "how old are you") or matchesWholePhrase(lower, "how old r you")
+		or matchesWholePhrase(lower, "how age are ya") or matchesWholePhrase(lower, "how age are u")
+		or matchesWholePhrase(lower, "how age r ya") or matchesWholePhrase(lower, "how age r u")
+		or matchesWholePhrase(lower, "what old are ya") or matchesWholePhrase(lower, "what old are u")
+		or matchesWholePhrase(lower, "what age are ya") or matchesWholePhrase(lower, "what age are u")
+		or matchesWholePhrase(lower, "what is your age") or matchesWholePhrase(lower, "whats your age")
+		or matchesWholePhrase(lower, "what's your age") or matchesWholePhrase(lower, "whats ya age")
+		or matchesWholePhrase(lower, "what's ya age") or matchesWholePhrase(lower, "what is ya age")
+		or matchesWholePhrase(lower, "what ya age") or matchesWholePhrase(lower, "whats ur agee")
+		or matchesWholePhrase(lower, "what's ur agee") or matchesWholePhrase(lower, "what is ur agee")
+		or matchesWholePhrase(lower, "whats ya agee") or matchesWholePhrase(lower, "what's ya agee")
+		or matchesWholePhrase(lower, "what is ya agee") or matchesWholePhrase(lower, "what ya agee")
+		or matchesWholePhrase(fuzzy, "howoldareyou") or matchesWholePhrase(fuzzy, "howoldareya")
+		or matchesWholePhrase(fuzzy, "howoldareu") or matchesWholePhrase(fuzzy, "howoldru")
+		or matchesWholePhrase(fuzzy, "howoldrya") or matchesWholePhrase(fuzzy, "howageareya")
+		or matchesWholePhrase(fuzzy, "howageareu") or matchesWholePhrase(fuzzy, "howageru")
+		or matchesWholePhrase(fuzzy, "howagerya") or matchesWholePhrase(fuzzy, "whatoldareya")
+		or matchesWholePhrase(fuzzy, "whatoldareu") or matchesWholePhrase(fuzzy, "whatisyourage")
+		or matchesWholePhrase(fuzzy, "whatsyourage") or matchesWholePhrase(fuzzy, "whatsyage")
+		or matchesWholePhrase(fuzzy, "whatsyagee") or matchesWholePhrase(fuzzy, "whatsage")
+		or matchesWholePhrase(fuzzy, "whatsagee") or matchesWholePhrase(lower, "whats ur age")
+		or matchesWholePhrase(lower, "what ur age") or matchesWholePhrase(lower, "ur age")
+		or matchesWholePhrase(nospace, "whatsurage") or matchesWholePhrase(nospace, "whaturage")
+		or matchesWholePhrase(nospace, "urage") or matchesWholePhrase(lower, "how old")
+		or matchesWholePhrase(lower, "old are you") or matchesWholePhrase(lower, "age?")
+		or matchesWholePhrase(lower, "ur age?") or matchesWholePhrase(lower, "your age?") then
+		flag("age_question")
+	end
+
+	if aggressiveLettersOnly == "howoldareya" or aggressiveLettersOnly == "howoldru" 
+		or aggressiveLettersOnly == "howoldrya" or aggressiveLettersOnly == "howoldareyou"
+		or aggressiveLettersOnly == "howoldareu" or aggressiveLettersOnly == "howageareya"
+		or aggressiveLettersOnly == "howageareu" or aggressiveLettersOnly == "whatoldareya"
+		or aggressiveLettersOnly == "whatoldareu" or aggressiveLettersOnly == "whatsyourage"
+		or aggressiveLettersOnly == "whatisyourage" or aggressiveLettersOnly == "whatsurage"
+		or aggressiveLettersOnly == "whaturage" or aggressiveLettersOnly == "urage"
+		or aggressiveLettersOnly == "whatsyage" or aggressiveLettersOnly == "whatsyagee"
+		or aggressiveLettersOnly == "whatsage" or aggressiveLettersOnly == "whatsagee" then
+		flag("age_question")
+	end
+
+	if lower:match("%f[%a]what['s]?%s+ya%s+agee?%f[%A]")
+		or lower:match("%f[%a]what['s]?%s+ur%s+agee?%f[%A]")
+		or lower:match("%f[%a]what%s+agee?%f[%A]")
+		or lower:match("%f[%a]how%s+old%f[%A]")
+		or lower:match("%f[%a]how%s+age%f[%A]")
+		or lower:match("%f[%a]what%s+old%f[%A]") then
+		flag("age_question")
+	end
+
+	if lower:match("%f[%a]age%f[%A]%s*%?") then flag("age_question") end
+	if fuzzy:find("yearsold", 1, true) or fuzzy:find("yrsold", 1, true) then flag("age_share") end
+	if lower:find("i[%s']*m %d%d") or lower:find("i am %d%d") then flag("age_share") end
+	if (#digitsOnly == 1 or #digitsOnly == 2) and digitsOnly == fuzzy then
+		local n = tonumber(digitsOnly)
+		local hasTimeContext = lower:match("%f[%a]sec%f[%A]") or lower:match("%f[%a]seconds%f[%A]")
+			or lower:match("%f[%a]min%f[%A]") or lower:match("%f[%a]minutes%f[%A]")
+			or lower:match("%f[%a]cooldown%f[%A]") or lower:match("%f[%a]level%f[%A]")
+			or lower:match("%f[%a]round%f[%A]") or lower:match("%f[%a]wave%f[%A]")
+		if n and n >= 1 and n <= 19 and not hasTimeContext then
+			flag("age_share_simple")
+		end
+	end
+	if fuzzy == "age" then
+		local safeAgeWords = {
+			["page"] = true, ["rage"] = true, ["sage"] = true, ["cage"] = true, ["wage"] = true,
+			["mage"] = true, ["gage"] = true, ["stage"] = true, ["image"] = true, ["message"] = true,
+			["passage"] = true, ["cabbage"] = true, ["bandage"] = true, ["damage"] = true,
+			["manage"] = true, ["package"] = true, ["voltage"] = true, ["village"] = true,
+			["marriage"] = true, ["mariage"] = true, ["courage"] = true, ["garage"] = true, ["language"] = true,
+		}
+		if not safeAgeWords[trimmed] then flag("age_word") end
+	end
+
+	do
+		local joinedFinal = lower:gsub("[^a-z]", "")
+
+		if hasContactIntent(lower) then
+			local normalized = collapseRuns(joinedFinal)
+			if detectOffPlatform(normalized) then
+				return true, { "contact_platform" }
+			end
+		end
+
+		-- FIX: EXPLICIT_SLURS check — only check slurs, NOT isaac/ike which are common names
+		for _, slur in ipairs(EXPLICIT_SLURS) do
+			local s = slur:gsub("%s+", "")
+			if joinedFinal:find(s, 1, true) then
+				flag("profanity")
+				break
+			end
+		end
+	end
+
+	hit = containsAny(fuzzy, HARASSMENT)
+	if hit then flag("harassment") end
+	if fuzzy == "old" then flag("harassment_old") end
+	local function containsDatingPatterns(lower2, fuzzy2, originalText)
+		local normalized = normalizeForDatingCheck(originalText)
+		local aggressiveNorm = removeAllNonLetters(originalText)
+		if aggressiveNorm == "boyfriend" or aggressiveNorm == "boyfrien" or aggressiveNorm == "boyfrend"
+			or aggressiveNorm == "girlfriend" or aggressiveNorm == "girlfrien" or aggressiveNorm == "girlfrend"
+			or aggressiveNorm == "boyfriendd" or aggressiveNorm == "girlfriendd" then return true end
+		if normalized:find("boy friend", 1, true) or normalized:find("boyfriend", 1, true) then
+			local wordCount = 0
+			for word in normalized:gmatch("%S+") do wordCount = wordCount + 1 end
+			if wordCount <= 10 then return true end
+			if normalized:find("be my", 1, true) or normalized:find("will you be", 1, true)
+				or normalized:find("will u be", 1, true) or normalized:find("wanna be", 1, true)
+				or normalized:find("want to be", 1, true) or normalized:find("will you", 1, true) then return true end
+		end
+		if normalized:find("girl friend", 1, true) or normalized:find("girlfriend", 1, true) then
+			local wordCount = 0
+			for word in normalized:gmatch("%S+") do wordCount = wordCount + 1 end
+			if wordCount <= 10 then return true end
+			if normalized:find("be my", 1, true) or normalized:find("will you be", 1, true)
+				or normalized:find("will u be", 1, true) or normalized:find("wanna be", 1, true)
+				or normalized:find("want to be", 1, true) or normalized:find("will you", 1, true) then return true end
+		end
+		if (normalized:find("bf", 1, true) or normalized:find("gf", 1, true)) then
+			if normalized:find("be my", 1, true) or normalized:find("will you be", 1, true)
+				or normalized:find("will u be", 1, true) or normalized:find("wanna be", 1, true)
+				or normalized:find("want to be", 1, true) then return true end
+		end
+		if normalized:find("will you be my", 1, true) or normalized:find("will u be my", 1, true)
+			or normalized:find("be my", 1, true) or normalized:find("want to date", 1, true)
+			or normalized:find("wanna date", 1, true) or normalized:find("go on a date", 1, true)
+			or normalized:find("dating me", 1, true) or normalized:find("date me", 1, true)
+			or normalized:find("go out with me", 1, true) or normalized:find("go out with u", 1, true) then return true end
+		if normalized:find("dating", 1, true) and (normalized:find("want") or normalized:find("wanna") or normalized:find("will")) then return true end
+		if lower2:find("boy", 1, true) and lower2:find("friend", 1, true) then
+			local boyPos = lower2:find("boy", 1, true)
+			local friendPos = lower2:find("friend", 1, true)
+			if boyPos and friendPos then
+				local distance = math.abs(boyPos - friendPos)
+				if distance <= 25 then
+					if #lower2 <= 50 or lower2:find("be my", 1, true) or lower2:find("will", 1, true) then return true end
+				end
+			end
+		end
+		if lower2:find("girl", 1, true) and lower2:find("friend", 1, true) then
+			local girlPos = lower2:find("girl", 1, true)
+			local friendPos = lower2:find("friend", 1, true)
+			if girlPos and friendPos then
+				local distance = math.abs(girlPos - friendPos)
+				if distance <= 25 then
+					if #lower2 <= 50 or lower2:find("be my", 1, true) or lower2:find("will", 1, true) then return true end
+				end
+			end
+		end
+		return false
+	end
+	if containsDatingPatterns(lower, fuzzy, raw) then
+		return true, { "dating" }
+	end
+	if matchesWholePhrase(lower, "trash") then
+		if matchesWholePhrase(lower, "you trash") or matchesWholePhrase(lower, "ur trash")
+			or matchesWholePhrase(lower, "your trash") or matchesWholePhrase(lower, "you're trash")
+			or matchesWholePhrase(lower, "u trash") or matchesWholePhrase(lower, "u r trash")
+			or fuzzy:find("urtrash", 1, true) or fuzzy:find("utrash", 1, true)
+			or fuzzy:find("youretrash", 1, true) or fuzzy:find("youaretrash", 1, true)
+			or fuzzy:find("yourtrash", 1, true) then flag("harassment_trash") end
+	end
+	return blocked, reasons
+end
+
+local function checkSpam(player, msg)
+	msg = msg:match("^%s*(.-)%s*$") or msg
+	local userId = player.UserId
+	local now = os.time()
+
+	local s = spamState[userId]
+	if not s then
+		s = { lastText = "", count = 0, windowStart = now }
+		spamState[userId] = s
+	end
+
+	if now - s.windowStart > SPAM_WINDOW_SECONDS then
+		s.count = 0
+		s.windowStart = now
+	end
+
+	if msg == s.lastText then
+		s.count += 1
+	else
+		s.lastText = msg
+		s.count = 1
+	end
+
+	return s.count < SPAM_MAX_IN_WINDOW, "spam_repeat"
+end
+
+local function containsBlockedAnatomyAnywhere(raw)
+	raw = tostring(raw or "")
+	raw = raw:sub(1, MAX_MESSAGE_LENGTH)
+
+	-- FIX: Removed "isaac" and "ike" from hard anatomy block
+	-- These are common names and cause massive false positives
+	-- They are now only blocked in explicit slur/sexual context via other checks
+
+	local lower = raw:lower()
+	local letters = lower:gsub("[^a-z]", "")
+
+	for word, _ in pairs(ANATOMY_STANDALONE) do
+		if letters == word then
+			return true
+		end
+		if letters:match("^(" .. word .. ")+$") then
+			return true
+		end
+		if lower:match("%f[%a]" .. word .. "%f[%A]") then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function containsAcrosticInstruction(msg)
+	local lower = tostring(msg or ""):lower()
+	lower = lower:gsub("[^a-z0-9%s]", " "):gsub("%s+", " ")
+
+	local hasInstruction =
+		lower:find("look at", 1, true)
+		or lower:find("check", 1, true)
+		or lower:find("read", 1, true)
+
+	local hasLetterTrick =
+		lower:find("first letter", 1, true)
+		or lower:find("first letters", 1, true)
+		or lower:find("last letter", 1, true)
+		or lower:find("end letter", 1, true)
+		or lower:find("middle letter", 1, true)
+
+	local hasMessageWord =
+		lower:find("message", 1, true)
+		or lower:find("messages", 1, true)
+		or lower:find("sentence", 1, true)
+		or lower:find("question", 1, true)
+
+	return hasInstruction and hasLetterTrick and hasMessageWord
+end
+
+local function shouldBlock(sender, rawMessage)
+
+	-- Exact harmless conversation exceptions
+	local check = rawMessage:lower()
+		:gsub("[^a-z0-9]", " ")
+		:gsub("%s+", " ")
+		:match("^%s*(.-)%s*$")
+
+
+	local safeQuestions = {
+		["what should i do to him"] = true,
+		["what should i do to her"] = true,
+		["what should i do to them"] = true,
+
+		["what should i do to him in game"] = true,
+		["what should i do to her in game"] = true,
+		["what should i do to them in game"] = true,
+
+		["what should i do to him in the game"] = true,
+		["what should i do to her in the game"] = true,
+		["what should i do to them in the game"] = true,
+
+		["what should i do to him in roblox"] = true,
+		["what should i do to her in roblox"] = true,
+		["what should i do to them in roblox"] = true,
+	}
+
+	if safeQuestions[check] then
+		return false, nil
+	end
+
+	-- 🔒 EARLIEST CHECK: Self-identification as dangerous person
+	-- Catches: "I am a pred", "I'm a predator", "I am a terrorist", "I'm a pred (testing)"
+	-- These were bypassing via isImVerbSentence early return
+	do
+		local m = collapseRuns(rawMessage:lower()
+			:gsub("|", "i"):gsub("§", "s"):gsub("!", "i"):gsub("@", "a")
+			:gsub("0", "o"):gsub("1", "i"):gsub("3", "e"):gsub("4", "a"):gsub("5", "s")
+			:gsub("[^a-z]", ""))
+
+		local dangerousIdentities = {
+			-- predator variants
+			"predator","predetor","predatorr","predd",
+			-- terrorist variants
+			"terrorist","terorist","terroristt",
+			-- pedo variants
+			"pedophile","pedofile","paedophile","paedo",
+			"pdf","pdfile","pdff",   -- bypass attempts for "ped"
+			-- rapist/murderer
+			"rapist","murderer",
+			-- child-specific
+			"childpredator","childmolester","childabuser",
+		}
+
+		for _, word in ipairs(dangerousIdentities) do
+			if m:find(word, 1, true) then
+				return true, "extreme"
+			end
+		end
+
+		-- "pred" is short so only block if combined with identity claim
+		-- "im a pred", "i am a pred", "ima pred"
+		if (m:find("imapred") or m:find("iamapred") or m:find("imapred") or m:find("iapred"))
+			or (m:find("pred") and (m:find("ima") or m:find("iam") or m:find("iam"))) then
+			return true, "extreme"
+		end
+
+		-- standalone "pred" or "pedo" as the entire message
+		local trimmedRaw = rawMessage:match("^%s*(.-)%s*$") or rawMessage
+		local trimmedLetters = collapseRuns(trimmedRaw:lower():gsub("[^a-z]", ""))
+		if trimmedLetters == "pred" or trimmedLetters == "predd"
+			or trimmedLetters == "pedo" or trimmedLetters == "paedo"
+			or trimmedLetters == "pdf" or trimmedLetters == "pdff" then
+			return true, "extreme"
+		end
+	end
+
+	if looksLikeMorseCode(rawMessage) then
+		return true, "encoded_message"
+	end
+
+	if containsLetterSubstitutionInstruction(rawMessage) then
+		return true, "bypass_instruction"
+	end
+
+	do
+		local trimmedMsg = rawMessage:match("^%s*(.-)%s*$") or rawMessage
+		if #trimmedMsg <= 15 and not isPlatformContentConversation(rawMessage:lower()) then
+			for token in trimmedMsg:gmatch("%a+") do
+				if isPlatformTypo(token:lower()) then
+					return true, "contact_platform"
+				end
+			end
+			-- catches separator-obfuscated spellings like "sma/p/p/" or "s.n.a.p"
+			local compact = collapseRuns(trimmedMsg:lower():gsub("[^a-z]", ""))
+			if isPlatformTypo(compact) then
+				return true, "contact_platform"
+			end
+		end
+	end
+
+	do
+		local whole = rawMessage:lower():match("^%s*(.-)%s*$") or ""
+		if SAFE_EXACT_WORDS[whole] then
+			return false, ""
+		end
+	end
+
+	if rawMessage:match("^rbxassetid://") or rawMessage:match("^rbxsatestid://") then
+		return false, ""
+	end
+
+	local function normalizeForExtremism(text)
+		local joined = text:lower()
+			:gsub("[^a-z]", "")
+		return collapseRuns(joined)
+	end
+
+	local function containsSSSturmbannfuhrer(norm)
+		return norm:find("sssturmbannfuhrer", 1, true)
+	end
+
+	local function containsSturmbannfuhrer(norm)
+		return norm:find("sturmbannfuhrer", 1, true)
+	end
+
+	local function containsSS(norm)
+		local naziSSPatterns = {
+			"waffenss", "schutzstaffel", "sssturmbannfuhrer",
+			"sturmbannfuhrer", "ssreich", "ssdivision",
+		}
+		for _, p in ipairs(naziSSPatterns) do
+			if norm:find(p, 1, true) then
+				return true
+			end
+		end
+		return false
+	end
+
+	do
+		local norm = normalizeForExtremism(rawMessage)
+
+		for _, term in ipairs(HARD_BLOCK_EXTREMIST_TERMS) do
+			local t = term:gsub("[^a-z]", "")
+			if norm:find(t, 1, true) then
+				return true, "extremism"
+			end
+		end
+
+		for _, term in ipairs(HARD_BLOCK_EXTREMIST_EXACT) do
+			local t = term:gsub("[^a-z]", "")
+			if norm:find(t, 1, true) then
+				return true, "extremism"
+			end
+		end
+
+		if containsSSSturmbannfuhrer(norm) then
+			return true, "extremism"
+		end
+
+		for _, p in ipairs(EXTREMIST_PEOPLE_STRICT) do
+			if norm:find(p:gsub("%s+", ""), 1, true) then
+				return true, "extremism"
+			end
+		end
+
+		for _, o in ipairs(EXTREMIST_ORGS_STRICT) do
+			if norm:find(o:gsub("%s+", ""), 1, true) then
+				return true, "extremism"
+			end
+		end
+
+		if containsSturmbannfuhrer(norm) and containsSS(norm) then
+			return true, "extremism"
+		end
+
+		for _, s in ipairs(EXTREMIST_SLOGANS_STRICT) do
+			if norm:find(s:gsub("%s+", ""), 1, true) then
+				return true, "extremism"
+			end
+		end
+	end
+
+	if containsBlockedAnatomyAnywhere(rawMessage) then
+		return true, "sexual_content"
+	end
+
+	-- FIX: Detect heavily obfuscated platform names like "d,c....cc?" or "d.i.s.c.o.r.d"
+	-- Only block if message is SHORT or has actual contact intent
+	do
+		local obfHit, obfPlatform = detectObfuscatedPlatform(rawMessage)
+		if obfHit then
+			local msgTrimmed = rawMessage:match("^%s*(.-)%s*$") or rawMessage
+			local msgLen = #msgTrimmed
+			local lower = rawMessage:lower()
+
+			-- Allow normal platform-content talk:
+			-- "that tiktok edit was funny"
+			-- "I saw a YouTube video"
+			-- "that Instagram post was cool"
+			if hasContactIntent(lower) then
+				return true, "contact_platform"
+			end
+			if not isPlatformContentConversation(lower) then
+				-- Still block short platform-only messages:
+				-- "discord?"
+				-- "insta?"
+				-- "tiktok?"
+				-- "yt?"
+				if msgLen <= 15 then
+					return true, "contact_platform"
+				end
+			end
+		end
+	end
+
+	-- FIX: extremism keyword-only check — now uses WHOLE WORD check to prevent
+	-- "lass" → false "ss" hit, "language" → false "nga" hit, etc.
+	do
+		local lower = rawMessage:lower()
+		-- Apply special char substitutions for bypass attempts
+		local lowerNorm = lower
+			:gsub("|", "i"):gsub("§", "s"):gsub("!", "i"):gsub("@", "a")
+			:gsub("0", "o"):gsub("1", "i"):gsub("3", "e"):gsub("4", "a"):gsub("5", "s")
+
+		-- Only block "nazi" if it appears as a standalone word
+		if lowerNorm:match("%f[%a]nazi%f[%A]") or lowerNorm:match("%f[%a]nazis%f[%A]") then
+			return true, "extremism"
+		end
+
+		-- Only block "hitler" / misspellings as standalone word
+		if lowerNorm:match("%f[%a]hitler%f[%A]")
+			or lowerNorm:match("%f[%a]hitier%f[%A]")
+			or lowerNorm:match("%f[%a]bitler%f[%A]") then  -- "heil bitler"
+			return true, "extremism"
+		end
+
+		-- swastika — was completely missing from all checks
+		local joinedNorm = collapseRuns(lowerNorm:gsub("[^a-z]", ""))
+		if joinedNorm:find("swastika", 1, true) or joinedNorm:find("svastika", 1, true) then
+			return true, "extremism"
+		end
+
+		-- osama bin laden references
+		if lowerNorm:match("%f[%a]osama%f[%A]") then
+			return true, "extremism"
+		end
+		if joinedNorm:find("osamabinladen", 1, true) or joinedNorm:find("binladen", 1, true) then
+			return true, "extremism"
+		end
+
+		-- eps island / little saint james (Epstein references from screenshot)
+		if joinedNorm:find("epsisland", 1, true)
+			or joinedNorm:find("epsteinisland", 1, true)
+			or joinedNorm:find("littlesaintjames", 1, true)
+			or (lowerNorm:find("eps", 1, true) and lowerNorm:find("island", 1, true))
+			or (lowerNorm:find("little", 1, true) and lowerNorm:find("saint", 1, true) and lowerNorm:find("james", 1, true)) then
+			return true, "extremism"
+		end
+
+		-- heil + partial word detection (catches "Heil Na**", "Heil Nati...")
+		if lowerNorm:match("heil%s*na") or lowerNorm:match("heil%s*hit")
+			or lowerNorm:match("heil%s*bit") or lowerNorm:match("sieg%s*hei") then
+			return true, "extremism"
+		end
+
+		-- "jew" as standalone with hate context
+		-- Only block if there's hate intent, not just mentioning the word
+		local hasJew = lowerNorm:match("%f[%a]jew%f[%A]") or lowerNorm:match("%f[%a]jews%f[%A]")
+		if hasJew then
+			local hateVerbs = {"hate","kill","gas","hang","die","burn","shoot","exterminate","eradicate"}
+			for _, v in ipairs(hateVerbs) do
+				if lowerNorm:find(v, 1, true) then
+					return true, "hate_violence"
+				end
+			end
+			-- "shut up jew" — insult standalone
+			if lowerNorm:match("shut%s*up%s*jew") or lowerNorm:match("stupid%s*jew")
+				or lowerNorm:match("dirty%s*jew") or lowerNorm:match("f+%s*jew")
+				or joinedNorm:find("shutupjew", 1, true) then
+				return true, "hate_violence"
+			end
+		end
+
+		-- "the blax suk" — racial slur + insult
+		if joinedNorm:find("blax", 1, true) then
+			return true, "profanity"
+		end
+
+		-- "i hate jews" / "i hate [group]"
+		for _, group in ipairs({"jews","muslims","blacks","whites","gays","christians","asians"}) do
+			if lowerNorm:find("i hate " .. group, 1, true)
+				or lowerNorm:find("i h8 " .. group, 1, true)
+				or joinedNorm:find("ihate" .. group, 1, true) then
+				return true, "hate_violence"
+			end
+		end
+	end
+
+	do
+		local joined = collapseRuns(rawMessage:lower():gsub("[^a-z]", ""))
+		if joined:match("^(vagina)+$") then
+			return true, "sexual_content"
+		end
+		if joined:match("^e+z+$") or joined:match("^z+z+z+$") then
+			return true, "toxic_spam"
+		end
+	end
+
+	do
+		local lwr = rawMessage:lower()
+		local fzy = collapseRuns(lwr:gsub("[^a-z]", ""))
+		if containsLatinForeignProfanity(lwr, fzy) then
+			return true, "profanity"
+		end
+	end
+
+	local okFront, reasonFront = hardBlockPII(rawMessage)
+	if not okFront then
+		return true, reasonFront
+	end
+
+	do
+		local normalized = rawMessage
+		normalized = normalizeForSafePhrase(normalized)
+		normalized = collapseRuns(normalized:gsub("[^a-z]", ""))
+		for _, phrase in ipairs(EXTREMIST_CALLS) do
+			if normalized:find(phrase, 1, true) then
+				return true, "extremism"
+			end
+		end
+	end
+
+	local lowerForHate = rawMessage:lower()
+	if isHateViolence(rawMessage)
+		and not isNormalConversationalSentence(rawMessage, lowerForHate, lowerForHate:match("^%s*(.-)%s*$") or lowerForHate)
+		and not containsSafePhrasePattern(rawMessage) then
+		return true, "hate_violence"
+	end
+
+	if isExtremistPraise(rawMessage) then
+		return true, "extremism"
+	end
+
+	local lower = rawMessage:lower():match("^%s*(.-)%s*$") or rawMessage:lower()
+	for _, phrase in ipairs(SAFE_MULTIWORD_PHRASES) do
+		if lower == phrase then
+			return false, ""
+		end
+	end
+
+	if containsAcrosticInstruction(rawMessage) then
+		return true, "bypass_instruction"
+	end
+
+	local isSplit, splitReason = checkSplitWords(sender, rawMessage)
+	if isSplit then
+		return true, splitReason
+	end
+
+	local okSpam, spamReason = checkSpam(sender, rawMessage)
+	if not okSpam then
+		return true, spamReason
+	end
+
+	local blocked, reasons = analyseMessage(rawMessage)
+	if blocked then
+		if reasons then
+			for _, r in ipairs(reasons) do
+				if r == "scam" then
+					return true, "scam"
+				end
+			end
+			for _, r in ipairs(reasons) do
+				if type(r) == "string" and r:find("pii_") then
+					return true, r
+				end
+			end
+		end
+		return true, reasons[1] or "safety"
+	end
+
+	return false, ""
+end
+
+local function robloxFilter(fromPlayer, rawMessage, toPlayer)
+	local ok, result = pcall(function()
+		local filterResult = TextService:FilterStringAsync(
+			rawMessage,
+			fromPlayer.UserId,
+			Enum.TextFilterContext.PublicChat
+		)
+		if toPlayer then
+			return filterResult:GetChatForUserAsync(toPlayer.UserId)
+		else
+			return filterResult:GetNonChatStringForBroadcastAsync()
+		end
+	end)
+	if ok and type(result) == "string" then
+		return result
+	end
+	return string.rep("#", math.min(#rawMessage, 20))
+end
+
+local function getFinalMessage(fromPlayer, rawMessage, toPlayer)
+	if containsBlockedAnatomyAnywhere(rawMessage) then
+		return BLOCK_TEXT, true, "sexual_content"
+	end
+
+	local filtered = robloxFilter(fromPlayer, rawMessage, toPlayer)
+
+	if type(filtered) ~= "string" then
+		filtered = string.rep("#", 10)
+	end
+
+	filtered = filtered:match("^%s*(.-)%s*$") or filtered
+	return filtered, false, ""
+end
+
+local function sendSystemMessage(player, text)
+	ChatEvent:FireClient(player, "System", text, nil, false, nil)
+end
+
+OwnerTagEvent.OnServerEvent:Connect(function(player, action, payload)
+	if player.UserId ~= OWNER_USER_ID then
+		return
+	end
+
+	payload = type(payload) == "table" and payload or {}
+
+	if action == "request" then
+		sendOwnerTagSync(player)
+		return
+	end
+
+	if action == "setTag" then
+		local userId = resolveUserId(payload.target or payload.userId or payload.username)
+
+		if not userId then
+			sendSystemMessage(player, "Could not find that player/user.")
+			return
+		end
+
+		local role = makeRole(payload.tag, payload.color)
+		if not role then
+			sendSystemMessage(player, "Tag cannot be empty.")
+			return
+		end
+
+		ownerTagData.users[tostring(userId)] = role
+
+		if ownerTagData.disabledDefaults then
+			ownerTagData.disabledDefaults[tostring(userId)] = nil
+		end
+
+		saveOwnerTags()
+		broadcastPlayerTag(userId)
+		sendOwnerTagSync(player)
+
+		sendSystemMessage(player, "Tag saved for UserId " .. tostring(userId) .. ".")
+		return
+	end
+
+	if action == "removeTag" then
+		local userId = resolveUserId(payload.target or payload.userId or payload.username)
+
+		if not userId then
+			sendSystemMessage(player, "Could not find that player/user.")
+			return
+		end
+
+		ownerTagData.users[tostring(userId)] = nil
+
+		if payload.suppressDefault == true then
+			if not ownerTagData.disabledDefaults then
+				ownerTagData.disabledDefaults = {}
+			end
+
+			ownerTagData.disabledDefaults[tostring(userId)] = true
+		else
+			if ownerTagData.disabledDefaults then
+				ownerTagData.disabledDefaults[tostring(userId)] = nil
+			end
+		end
+
+		saveOwnerTags()
+		broadcastPlayerTag(userId)
+		sendOwnerTagSync(player)
+
+		sendSystemMessage(player, "Custom tag removed for UserId " .. tostring(userId) .. ".")
+		return
+	end
+
+	if action == "ownerMessage" then
+		local msg = tostring(payload.message or "")
+		msg = msg:match("^%s*(.-)%s*$") or ""
+
+		if msg == "" then return end
+		if #msg > MAX_MESSAGE_LENGTH then
+			msg = msg:sub(1, MAX_MESSAGE_LENGTH)
+		end
+
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local finalText = robloxFilter(player, msg, plr)
+			ChatEvent:FireClient(
+				plr,
+				player.Name,
+				finalText,
+				nil,
+				false,
+				player,
+				getTagForUserId(player.UserId)
+			)
+		end
+
+		return
+	end
+end)
+
+--------------------------------------------------------
+-- MAIN CHAT HANDLER
+--------------------------------------------------------
+
+local ALLOWED_STICKERS = {
+	["rbxassetid://84901275809333"] = true,
+	["rbxassetid://82880579359009"] = true,
+	["rbxassetid://117736321880259"] = true,
+	["rbxassetid://96821807002416"] = true,
+	["rbxassetid://81221154258567"] = true,
+	["rbxassetid://105195554463918"] = true,
+}
+
+ChatEvent.OnServerEvent:Connect(function(player, message, whisperTarget)
+	if typeof(message) ~= "string" then return end
+	local blocked, reason = isToxic(message)
+
+	if blocked then
+		logModeration(player, message, reason or "harassment", "BLOCKED")
+		sendSystemMessage(
+			player,
+			"Your message was adjusted to keep chat safe (" .. (reason or "unsafe content") .. ")."
+		)
+		return
+	end
+
+	if typeof(message) ~= "string" then 
+		return 
+	end
+
+	if message:match("^rbxassetid://") or message:match("^rbxsatestid://") then
+		if not ALLOWED_STICKERS[message] then return end
+		if lastStickerTime[player] == nil then
+			lastStickerTime[player] = 0
+		end
+		if not stickerCooldowns then
+			stickerCooldowns = {}
+		end
+		local now = os.time()
+		local timeSinceLastSticker = now - lastStickerTime[player]
+		if timeSinceLastSticker < STICKER_COOLDOWN then
+			local timeLeft = STICKER_COOLDOWN - timeSinceLastSticker
+			stickerCooldowns[player] = now + STICKER_COOLDOWN
+			sendSystemMessage(player, "⏳ Please wait " .. math.ceil(timeLeft) .. " seconds before sending another sticker")
+			return
+		end
+		lastStickerTime[player] = now
+		stickerCooldowns[player] = now + STICKER_COOLDOWN
+		local StickerCooldownEvent = ReplicatedStorage:FindFirstChild("StickerCooldownEvent")
+		if not StickerCooldownEvent then
+			StickerCooldownEvent = Instance.new("RemoteEvent")
+			StickerCooldownEvent.Name = "StickerCooldownEvent"
+			StickerCooldownEvent.Parent = ReplicatedStorage
+		end
+		StickerCooldownEvent:FireClient(player, lastStickerTime[player] + STICKER_COOLDOWN)
+		for _, plr in ipairs(Players:GetPlayers()) do
+			ChatEvent:FireClient(plr, "Sticker", message, nil, false, player)
+		end
+		return
+	end
+
+	if matchesHardBlock(message) then
+		logModeration(player, message, "explicit_threat", "HARD_BLOCK_IMAGE_PHRASE")
+		sendSystemMessage(
+			player,
+			"Your message was blocked due to dangerous or threatening content."
+		)
+		return
+	end
+
+	do
+		local joined = collapseRuns(string.lower(message):gsub("[^a-z]", ""))
+		if joined:find("hitlerwasright", 1, true) then
+			logModeration(player, message, "extremism", "HARD_EARLY_BLOCK")
+			sendSystemMessage(player, "Your message was blocked due to harmful or extremist content.")
+			return
+		end
+	end
+
+	do
+		local joined = collapseRuns(string.lower(message):gsub("[^a-z]", ""))
+		local fuzzyTargets = {
+			"diddy", "pdiddy", "seancombs",
+			"epstein", "ebstein", "ebstean", "epstean",
+		}
+		for _, t in ipairs(fuzzyTargets) do
+			if joined:find(t, 1, true) then
+				logModeration(player, message, "extreme_figure", "HARD_EARLY_BLOCK")
+				sendSystemMessage(player, "Your message was blocked due to inappropriate content.")
+				return
+			end
+		end
+	end
+
+	if typeof(whisperTarget) == "Instance" and whisperTarget:IsA("Player") then
+		local targetPlayer = whisperTarget
+		if targetPlayer == player then
+			sendSystemMessage(player, "You can't whisper to yourself")
+			return
+		end
+		if #message > MAX_EXTREME_LENGTH then return end
+		message = string.sub(message, 1, MAX_MESSAGE_LENGTH)
+		if type(muteUntil[player]) == "number" and muteUntil[player] > os.time() then
+			sendSystemMessage(player, MUTE_TEXT)
+			return
+		end
+		if serverMutes[targetPlayer.UserId] and serverMutes[targetPlayer.UserId][player.UserId] then return end
+		if os.clock() - (lastWhisperTime[player] or 0) < SPAM_COOLDOWN then return end
+		lastWhisperTime[player] = os.clock()
+		local shouldBlockMessage, blockReason = shouldBlock(player, message)
+		if shouldBlockMessage then
+			logModeration(player, message, blockReason, "BLOCKED_WHISPER")
+			sendSystemMessage(player, "Your whisper was blocked: " .. tostring(blockReason))
+			return
+		end
+		messageHistory[player] = messageHistory[player] or {}
+		table.insert(messageHistory[player], message)
+		if #messageHistory[player] > SPAM_MAX_IN_WINDOW then table.remove(messageHistory[player], 1) end
+		local filteredForSender, _, _ = getFinalMessage(player, message, player)
+		local filteredForTarget, _, _ = getFinalMessage(player, message, targetPlayer)
+		ChatEvent:FireClient(player, "You -> " .. targetPlayer.Name, filteredForSender, nil, true, player, getTagForUserId(player.UserId))
+		ChatEvent:FireClient(targetPlayer, player.Name, filteredForTarget, nil, true, player, getTagForUserId(player.UserId))
+		logModeration(player, "Whisper to " .. targetPlayer.Name .. ": " .. message, "whisper", "SENT")
+		return
+	end
+
+	local isTeamChat = (whisperTarget == "team")
+	if isTeamChat and not player.Team then
+		sendSystemMessage(player, "You need to be on a team to use team chat! Switching to All Chat.")
+		isTeamChat = false
+		whisperTarget = "all"
+	end
+
+	if typeof(message) ~= "string" then 
+		return 
+	end
+
+	if matchesHardBlock(message) then
+		logModeration(player, message, "explicit_threat", "HARD_BLOCK_IMAGE_PHRASE")
+		sendSystemMessage(
+			player,
+			"Your message was blocked due to dangerous or threatening content."
+		)
+		return
+	end
+
+	do
+		local joined = collapseRuns(string.lower(message):gsub("[^a-z]", ""))
+		if joined:find("hitlerwasright", 1, true) then
+			logModeration(player, message, "extremism", "HARD_EARLY_BLOCK")
+			sendSystemMessage(player, "Your message was blocked due to harmful or extremist content.")
+			return
+		end
+	end
+
+	local isTeamChat2 = (whisperTarget == "team")
+	if isTeamChat2 and not player.Team then
+		sendSystemMessage(player, "You need to be on a team to use team chat! Switching to All Chat.")
+		isTeamChat = false
+		whisperTarget = "all"
+	end
+
+	if #message > MAX_EXTREME_LENGTH then
+		sendSystemMessage(player, "Message too long. Maximum length is " .. MAX_EXTREME_LENGTH .. " characters.")
+		return
+	end
+
+	message = string.sub(message, 1, MAX_MESSAGE_LENGTH)
+
+	local trimmedMessage = message:match("^%s*(.-)%s*$") or message
+	if trimmedMessage == "" then 
+		return 
+	end
+	message = trimmedMessage
+
+	if handleEmoteCommand(player, message) then
+		return
+	end
+
+	if lastMessageTime[player] == nil then
+		lastMessageTime[player] = {}
+		messageHistory[player] = {}
+		blockedHistory[player] = {}
+		muteUntil[player] = 0
+	end
+
+	if not spamState[player.UserId] then
+		spamState[player.UserId] = { count = 0, windowStart = os.time() }
+	end
+
+	local now = os.time()
+	local spamInfo = spamState[player.UserId]
+
+	if now - spamInfo.windowStart > SPAM_WINDOW_SECONDS then
+		spamInfo.count = 0
+		spamInfo.windowStart = now
+	end
+
+	local shouldBlockMessage, blockReasonCheck = shouldBlock(player, message)
+
+	if shouldBlockMessage then
+		warn("[CHAT DEBUG] Blocked message:",
+			message,
+			"| Reason:",
+			tostring(blockReasonCheck))
+	else
+		print("[CHAT DEBUG] Passed moderation:", message)
+	end
+
+	if shouldBlockMessage then
+		if shouldBlockMessage and
+			(blockReasonCheck == "contact_platform"
+				or blockReasonCheck == "contact_phrase"
+				or blockReasonCheck == "contact_url") then
+
+			logModeration(player, message, blockReasonCheck, "BLOCKED_OFF_PLATFORM")
+			sendSystemMessage(
+				player,
+				"Off-platform contact is not allowed in this chat."
+			)
+			messageHistory[player] = {}
+			blockedHistory[player] = {}
+			lastMessageTime[player] = {}
+			spamState[player.UserId] = { count = 0, windowStart = os.time(), lastText = "" }
+			return
+		end
+
+		logModeration(player, message, blockReasonCheck, "BLOCKED")
+
+		if blockReasonCheck == "extremism" or blockReasonCheck == "hate_violence" then
+			sendSystemMessage(
+				player,
+				"Your message was blocked due to harmful or extremist content."
+			)
+			return
+		end
+
+		local displayReason
+		if blockReasonCheck == "scam" then
+			displayReason = "scam or fake reward"
+		elseif blockReasonCheck == "cringe" then
+			displayReason = "message not appropriate for this chat"
+		elseif blockReasonCheck == "profanity" then
+			displayReason = "inappropriate language"
+		elseif blockReasonCheck == "single_letter"
+			or blockReasonCheck == "gibberish_letters"
+			or blockReasonCheck == "alnum_random"
+			or blockReasonCheck == "number_only"
+			or blockReasonCheck == "toxic_spam"
+			or blockReasonCheck == "spam_repeat"
+			or blockReasonCheck == "spam_rate" then
+			displayReason = "please don't spam random letters or numbers"
+		elseif blockReasonCheck == "non_english" then
+			displayReason = "English only chat"
+		elseif blockReasonCheck == "pii_real_name" then
+			displayReason = "personal information (real name)"
+		elseif blockReasonCheck:find("pii_") then
+			displayReason = "personal information"
+		elseif blockReasonCheck:find("age_") then
+			displayReason = "age discussion"
+		elseif blockReasonCheck == "contact_platform" then
+			displayReason = "off-platform contact"
+		elseif blockReasonCheck == "dating" then
+			displayReason = "dating requests"
+		elseif blockReasonCheck == "excessive_repeats" then
+			displayReason = "suspicious formatting"
+		elseif blockReasonCheck == "contact_image_url" then
+			displayReason = "image sharing"
+		else
+			displayReason = "unsafe content"
+		end
+
+		sendSystemMessage(
+			player,
+			"Your message was adjusted to keep chat safe (" .. displayReason .. ")."
+		)
+
+		if player.UserId ~= OWNER_USER_ID then
+			blockedHistory[player] = blockedHistory[player] or {}
+			if blockReasonCheck ~= "contact_platform"
+				and blockReasonCheck ~= "contact_phrase"
+				and blockReasonCheck ~= "contact_url" then
+				table.insert(blockedHistory[player], blockReasonCheck)
+			end
+
+			if #blockedHistory[player] > MUTE_THRESHOLD * 2 then
+				table.remove(blockedHistory[player], 1)
+			end
+
+			if #blockedHistory[player] >= MUTE_THRESHOLD then
+				for _, r in ipairs(blockedHistory[player]) do
+					if r == "contact_platform" or r == "contact_phrase" or r == "contact_url" then
+						blockedHistory[player] = {}
+						return
+					end
+				end
+				muteUntil[player] = os.time() + MUTE_DURATION
+				blockedHistory[player] = {}
+				sendSystemMessage(player, MUTE_TEXT)
+			end
+		end
+
+		spamState[player.UserId].lastText = ""
+		if blockReasonCheck == "contact_platform" or blockReasonCheck == "contact_phrase" or blockReasonCheck == "contact_url" then
+			messageHistory[player] = {}
+			lastMessageTime[player] = {}
+		end
+		spamState[player.UserId].lastText = ""
+		return
+	end
+
+	table.insert(lastMessageTime[player], now)
+	table.insert(messageHistory[player], message)
+
+	if #lastMessageTime[player] > SPAM_MAX_IN_WINDOW then
+		table.remove(lastMessageTime[player], 1)
+		table.remove(messageHistory[player], 1)
+	end
+
+	local cleanSpamText = normalizeSpamMessage(message)
+	local spamInfo2 = spamState[player.UserId]
+
+	if cleanSpamText ~= "" then
+		if spamInfo2.lastText == cleanSpamText then
+			spamInfo2.repeatCount = (spamInfo2.repeatCount or 1) + 1
+		else
+			spamInfo2.lastText = cleanSpamText
+			spamInfo2.repeatCount = 1
+		end
+
+		if spamInfo2.repeatCount > REPEAT_MESSAGE_LIMIT then
+			sendSystemMessage(player, WARN_SPAM_TEXT)
+			logModeration(player, message, "spam_repeat", "BLOCKED")
+
+			table.remove(lastMessageTime[player])
+			table.remove(messageHistory[player])
+
+			if spamInfo2.repeatCount >= REPEAT_MESSAGE_MUTE_LIMIT then
+				muteUntil[player] = os.time() + MUTE_DURATION
+				spamInfo2.repeatCount = 0
+				spamInfo2.lastText = ""
+				sendSystemMessage(player, MUTE_TEXT)
+			end
+
+			return
+		end
+	end
+
+	local timeSinceLast = now - (lastMessageTime[player][#lastMessageTime[player] - 1] or 0)
+	if timeSinceLast < SPAM_COOLDOWN and #lastMessageTime[player] > 1 then
+		sendSystemMessage(player, WARN_SPAM_TEXT)
+		logModeration(player, message, "spam_rate", "WARNED")
+		table.remove(lastMessageTime[player])
+		table.remove(messageHistory[player])
+		return
+	end
+
+	if type(muteUntil[player]) == "number" then
+		if muteUntil[player] > now then
+			sendSystemMessage(player, MUTE_TEXT)
+			table.remove(lastMessageTime[player])
+			table.remove(messageHistory[player])
+			return
+		else
+			muteUntil[player] = 0
+		end
+	end
+
+	if containsBlockedAnatomyAnywhere(message) then
+		logModeration(player, message, "sexual_content", "HARD_SEND_BLOCK")
+		return
+	end
+
+	local playerMessages = {}
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local finalText, blocked, reason = getFinalMessage(player, message, plr)
+
+		if blocked then
+			finalText = BLOCK_TEXT
+		end
+
+		if not finalText or finalText == "" or type(finalText) ~= "string" then
+			finalText = message
+		end
+
+		local trimmed = finalText:match("^%s*(.-)%s*$")
+		if trimmed and trimmed ~= "" then
+			finalText = trimmed
+		else
+			finalText = message
+		end
+
+		finalText = tostring(finalText)
+
+		if finalText == "" then
+			finalText = message
+		end
+
+		playerMessages[plr] = { text = finalText, blocked = blocked, reason = reason }
+	end
+
+	local senderTeam = player.Team
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local shouldSend = true
+
+		if serverMutes[plr.UserId] and serverMutes[plr.UserId][player.UserId] then
+			shouldSend = false
+		end
+
+		if isTeamChat then
+			if not senderTeam then
+				shouldSend = false
+			elseif plr.Team ~= senderTeam then
+				shouldSend = false
+			end
+		end
+
+		if shouldSend then
+			local msgData = playerMessages[plr]
+			if msgData and msgData.text and msgData.text ~= "" then
+				local textToSend = tostring(msgData.text)
+				textToSend = textToSend:match("^%s*(.-)%s*$") or textToSend
+				if textToSend and textToSend ~= "" then
+					ChatEvent:FireClient(plr, player.Name, textToSend, nil, false, player, getTagForUserId(player.UserId))
+				end
+			end
+		end
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local shouldSend = true
+
+		if serverMutes[plr.UserId] and serverMutes[plr.UserId][player.UserId] then
+			shouldSend = false
+		end
+
+		if isTeamChat then
+			if not senderTeam then
+				shouldSend = false
+			elseif plr.Team ~= senderTeam then
+				shouldSend = false
+			end
+		end
+
+		if shouldSend then
+			local msgData = playerMessages[plr]
+			if msgData and msgData.text and msgData.text ~= "" then
+				local textToSend = tostring(msgData.text)
+				textToSend = textToSend:match("^%s*(.-)%s*$") or textToSend
+				if textToSend and textToSend ~= "" then
+					ChatEvent:FireClient(plr, "BUBBLE", textToSend, nil, false, player)
+				end
+			end
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	lastMessageTime[plr] = nil
+	messageHistory[plr] = nil
+	blockedHistory[plr] = nil
+	muteUntil[plr] = nil
+	spamState[plr.UserId] = nil
+	lastStickerTime[plr] = nil
+	stickerCooldowns[plr] = nil
+	if typingState[plr] then
+		if typingState[plr].thread then task.cancel(typingState[plr].thread) end
+		typingState[plr] = nil
+	end
+end)
+
+Players.PlayerAdded:Connect(function(plr)
+	task.wait(1)
+	sendSystemMessage(plr, "Chat loaded. All messages go through safety filtering. English-only messages.")
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= plr then
+			sendSystemMessage(player, plr.Name .. " has joined the game")
+		end
+	end
+
+	restoreMuteStateForPlayer(plr)
+	notifyExistingPlayersOfRejoin(plr)
+
+	broadcastPlayerTag(plr.UserId)
+
+	if plr.UserId == OWNER_USER_ID then
+		sendOwnerTagSync(plr)
+	end
+end)
+
+print("ChatHandler v2 (false-positive fixed) loaded!")

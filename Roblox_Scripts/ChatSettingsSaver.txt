@@ -1,0 +1,45 @@
+-- ChatSettingsSaver (ServerScript in ServerScriptService)
+-- Saves and loads chat customization settings per player
+
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local ChatSettingsStore = DataStoreService:GetDataStore("ChatCustomizationV1")
+
+-- Create RemoteFunction for save/load
+local ChatSettingsRemote = Instance.new("RemoteFunction")
+ChatSettingsRemote.Name = "ChatSettingsRemote"
+ChatSettingsRemote.Parent = ReplicatedStorage
+
+local function getKey(player)
+	return "ChatSettings_" .. player.UserId
+end
+
+ChatSettingsRemote.OnServerInvoke = function(player, action, data)
+	if action == "load" then
+		local ok, result = pcall(function()
+			return ChatSettingsStore:GetAsync(getKey(player))
+		end)
+		if ok then
+			return result
+		end
+		return nil
+
+	elseif action == "save" and typeof(data) == "table" then
+		pcall(function()
+			ChatSettingsStore:SetAsync(getKey(player), data)
+		end)
+		return true
+	end
+
+	return nil
+end
+
+-- Auto-save on player leaving (safety net)
+Players.PlayerRemoving:Connect(function(player)
+	-- Settings are saved in real-time from client, this is just a log
+	print("[ChatSettings] Player leaving:", player.Name)
+end)
+
+print("[ChatSettings] Server-side saver loaded.")

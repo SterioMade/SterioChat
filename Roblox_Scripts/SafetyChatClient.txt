@@ -1,0 +1,4361 @@
+-- StarterPlayerScripts.SafetyChatClient  (LocalScript)
+-- FIXED: UI appears even if server isn't ready, better error handling
+-- CRITICAL FIX: Don't create bubbles until server confirms message is allowed
+-- NEW: Team chat toggle button - switch between Team Chat and All Chat (always visible)
+-- FIXED: Button positioning and styling to match title text
+-- NEW: Smooth professional animations for UI interactions
+-- FIXED: All internal elements fade smoothly with the main frame
+-- FIXED: Team chat button text updates immediately on click with smooth transitions
+-- FIXED: Only username colored by team, message text always white
+-- FIXED: Button text changes immediately on click, even when hovering
+-- FIXED: Button click detection - both buttons work reliably without cursor movement
+-- FIXED: Input stability - removed delays and improved focus handling
+-- FIXED: Out of local registers - reduced locals per scope via do-end blocks
+
+local Players = game:GetService("Players")
+local StarterGui = game:GetService("StarterGui")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TextChatService = game:GetService("TextChatService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+-- 🔒 CHAT BUBBLE DISTANCE (STUDS)
+local CHAT_BUBBLE_DISTANCE = 80
+
+_G.MAX_CHAT_BUBBLE_WIDTH = 400
+_G.RGB_OUTLINE_THICKNESS = 1.5
+_G.RGB_OUTLINE_MIN = 1
+_G.RGB_OUTLINE_MAX = 5
+_G.RGB_BUBBLES_ENABLED = false
+local DEFAULT_OUTLINE_THICKNESS = 1.5
+
+local function createSmoothTween(instance, properties, duration, easingStyle, easingDirection, callback)
+	local tweenInfo = TweenInfo.new(
+		duration or 0.3,
+		easingStyle or Enum.EasingStyle.Quad,
+		easingDirection or Enum.EasingDirection.Out
+	)
+	local tween = TweenService:Create(instance, tweenInfo, properties)
+	if callback then
+		tween.Completed:Connect(callback)
+	end
+	tween:Play()
+	return tween
+end
+
+local function forceTextRefresh(textButton, newText)
+	textButton.Text = ""
+	task.wait(0)
+	textButton.Text = newText
+end
+
+local localPlayer = Players.LocalPlayer
+
+task.wait(0.5)
+
+local playerGui = localPlayer:WaitForChild("PlayerGui", 10)
+if not playerGui then
+	warn("PlayerGui not found! Chat UI cannot be created.")
+	return
+end
+
+print("SafetyChatClient: Starting initialization...")
+
+--------------------------------------------------------------------
+-- Disable default Roblox chat UI (robust, retried, and re-enforced)
+--------------------------------------------------------------------
+local function disableDefaultChatUI()
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, false)
+	end)
+
+	pcall(function()
+		local inputCfg = TextChatService:WaitForChild("ChatInputBarConfiguration", 5)
+		if inputCfg then
+			inputCfg.Enabled = false
+		end
+	end)
+
+	pcall(function()
+		local bubbleCfg = TextChatService:WaitForChild("BubbleChatConfiguration", 5)
+		if bubbleCfg then
+			bubbleCfg.Enabled = false
+		end
+	end)
+
+	pcall(function()
+		local windowCfg = TextChatService:WaitForChild("ChatWindowConfiguration", 5)
+		if windowCfg then
+			windowCfg.Enabled = false
+		end
+	end)
+end
+
+-- Try immediately...
+disableDefaultChatUI()
+
+-- ...and keep re-enforcing for a while in case something resets it
+-- (slow replication, late-loading config, respawn, etc.)
+task.spawn(function()
+	for i = 1, 12 do
+		task.wait(1)
+		disableDefaultChatUI()
+	end
+end)
+
+-- Also re-enforce whenever the character (re)spawns, since some
+-- CoreGui/TextChatService settings can get reset on respawn
+localPlayer.CharacterAdded:Connect(function()
+	task.wait(0.5)
+	disableDefaultChatUI()
+end)
+
+--------------------------------------------------------------------
+-- Remotes
+--------------------------------------------------------------------
+local ChatEvent = ReplicatedStorage:FindFirstChild("ChatEvent")
+local EmoteEvent = ReplicatedStorage:FindFirstChild("EmoteEvent")
+
+do
+	local maxAttempts = 10
+	local attempt = 0
+	while not ChatEvent and attempt < maxAttempts do
+		attempt = attempt + 1
+		print("Waiting for ChatEvent... Attempt " .. attempt .. "/" .. maxAttempts)
+		task.wait(1)
+		ChatEvent = ReplicatedStorage:FindFirstChild("ChatEvent")
+	end
+	if not ChatEvent then
+		warn("CRITICAL: ChatEvent still not found after " .. maxAttempts .. " attempts!")
+		ChatEvent = Instance.new("RemoteEvent")
+		ChatEvent.Name = "ChatEvent"
+		ChatEvent.Parent = ReplicatedStorage
+	else
+		print("✓ ChatEvent found successfully")
+	end
+end
+
+do
+	if not EmoteEvent then
+		EmoteEvent = ReplicatedStorage:FindFirstChild("EmoteEvent")
+		if not EmoteEvent then
+			print("EmoteEvent not found - emotes will be disabled")
+			EmoteEvent = Instance.new("RemoteEvent")
+			EmoteEvent.Name = "EmoteEvent"
+			EmoteEvent.Parent = ReplicatedStorage
+		end
+	else
+		print("✓ EmoteEvent found")
+	end
+end
+
+local TypingEvent = ReplicatedStorage:WaitForChild("TypingEvent", 10)
+if not TypingEvent then
+	TypingEvent = Instance.new("RemoteEvent")
+	TypingEvent.Name = "TypingEvent"
+	TypingEvent.Parent = ReplicatedStorage
+end
+
+local OWNER_USER_ID = 2430602749
+local OwnerTagEvent = ReplicatedStorage:WaitForChild("OwnerTagEvent", 10)
+
+local ownerRoleCache = {}
+
+--------------------------------------------------------------------
+-- Team chat state
+--------------------------------------------------------------------
+local currentChatMode = "all"
+local whisperTargetPlayer = nil
+local toggleSettingsPanel
+local toggleOwnerPanel
+local toggleMutePanel
+local toggleStickerPicker
+local closeAllSidePanels
+
+--------------------------------------------------------------------
+-- MUTE STATE
+--------------------------------------------------------------------
+local mutedPlayers = {}
+local muteCooldowns = {}
+local mutedByOthers = {}
+
+local function isMuted(player)
+	return mutedPlayers[player] or mutedByOthers[player]
+end
+
+--------------------------------------------------------------------
+-- EMOTE HANDLING
+--------------------------------------------------------------------
+local currentEmoteTrack = nil
+local currentHumanoid = nil
+
+local function stopEmote()
+	if currentEmoteTrack then
+		currentEmoteTrack:Stop()
+		currentEmoteTrack = nil
+	end
+	if currentHumanoid then
+		pcall(function() currentHumanoid:PlayEmote("") end)
+		currentHumanoid = nil
+	end
+end
+
+local function playEmote(emoteName)
+	local character = localPlayer.Character
+	if not character then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return end
+	stopEmote()
+
+	local success, result = pcall(function()
+		currentHumanoid = humanoid
+		return humanoid:PlayEmote(emoteName)
+	end)
+	if success and result then return end
+
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if not animator then return end
+
+	local EMOTE_ANIMATIONS = {
+		["dance"]="rbxassetid://507771019",["wave"]="rbxassetid://507770239",
+		["cheer"]="rbxassetid://507770453",["laugh"]="rbxassetid://507770818",
+		["point"]="rbxassetid://507770677",["shrug"]="rbxassetid://507770453",
+		["applaud"]="rbxassetid://507770239",["tilt"]="rbxassetid://507770239",
+		["hello"]="rbxassetid://507770239",["dance1"]="rbxassetid://507771019",
+		["dance2"]="rbxassetid://507771019",["dance3"]="rbxassetid://507771019",
+		["sit"]="rbxassetid://507767968",["salute"]="rbxassetid://507770239",
+		["bow"]="rbxassetid://507770239",["clap"]="rbxassetid://507770239",
+		["nod"]="rbxassetid://507770239",["shake"]="rbxassetid://507770239",
+		["floss"]="rbxassetid://507771019",["gangnam"]="rbxassetid://507771019",
+		["zen"]="rbxassetid://507770239",["ninja"]="rbxassetid://507770239",
+		["magic"]="rbxassetid://507770239",["karate"]="rbxassetid://507770239",
+		["sneak"]="rbxassetid://507770239",["zombie"]="rbxassetid://507770239",
+		["robot"]="rbxassetid://507770239",["vampire"]="rbxassetid://507770239",
+		["werewolf"]="rbxassetid://507770239",["superhero"]="rbxassetid://507770239",
+	}
+
+	local animationId = EMOTE_ANIMATIONS[string.lower(emoteName)]
+	if not animationId then return end
+
+	local animation = Instance.new("Animation")
+	animation.AnimationId = animationId
+	local track = animator:LoadAnimation(animation)
+	if track then
+		currentEmoteTrack = track
+		currentHumanoid = humanoid
+		track:Play()
+		track.Ended:Connect(function()
+			if currentEmoteTrack == track then
+				currentEmoteTrack = nil
+				currentHumanoid = nil
+			end
+		end)
+	end
+end
+
+if EmoteEvent then
+	EmoteEvent.OnClientEvent:Connect(function(emoteName)
+		playEmote(emoteName)
+	end)
+end
+
+local function setupMovementDetection()
+	local movementCheckConnection = nil
+	local function onCharacterAdded(character)
+		local humanoid = character:WaitForChild("Humanoid", 5)
+		if not humanoid then return end
+		if movementCheckConnection then movementCheckConnection:Disconnect() end
+		movementCheckConnection = RunService.Heartbeat:Connect(function()
+			if currentEmoteTrack or currentHumanoid then
+				if humanoid.MoveDirection.Magnitude > 0.1 then stopEmote() end
+			end
+		end)
+		character.AncestryChanged:Connect(function()
+			if not character.Parent then
+				if movementCheckConnection then
+					movementCheckConnection:Disconnect()
+					movementCheckConnection = nil
+				end
+				stopEmote()
+			end
+		end)
+	end
+	if localPlayer.Character then onCharacterAdded(localPlayer.Character) end
+	localPlayer.CharacterAdded:Connect(onCharacterAdded)
+	localPlayer.AncestryChanged:Connect(function()
+		if not localPlayer.Parent then
+			if movementCheckConnection then
+				movementCheckConnection:Disconnect()
+				movementCheckConnection = nil
+			end
+		end
+	end)
+end
+setupMovementDetection()
+
+--------------------------------------------------------------------
+-- CHAT BUBBLES
+--------------------------------------------------------------------
+local activeChatBubbles = {}
+
+local function isWithinBubbleDistance(character)
+	local camera = workspace.CurrentCamera
+	if not camera or not character then return false end
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then return false end
+	return (camera.CFrame.Position - root.Position).Magnitude <= CHAT_BUBBLE_DISTANCE
+end
+
+local function createChatBubble(player, message)
+	-- Strip "Username: " prefix if present
+	local colonPos = message:find(": ")
+	if colonPos then
+		message = message:sub(colonPos + 2)
+	end
+	if not player or not player.Character then return end
+	if not isWithinBubbleDistance(player.Character) then return end
+	local head = player.Character:FindFirstChild("Head")
+	if not head then return end
+	if message:match("^/e") then return end
+
+	for _, child in ipairs(head:GetChildren()) do
+		if child:IsA("BillboardGui") and child.Name == "StickerBubble" then
+			child:Destroy()
+		end
+		if child:IsA("BillboardGui") and child.Name == "TypingHeadBubble" then
+			child:Destroy()
+		end
+	end
+
+	if player and player.Character then
+		local h = player.Character:FindFirstChild("Head")
+		if h then
+			for _, child in ipairs(h:GetChildren()) do
+				if child:IsA("BillboardGui") and child.Name == "TypingHeadBubble" then
+					child:Destroy()
+				end
+			end
+		end
+	end
+
+	local existing = activeChatBubbles[player]
+	if existing and existing.label and existing.gui and existing.gui.Parent then
+		existing.label.Text = message
+		do
+			local textService = game:GetService("TextService")
+			local maxBubbleWidth = _G.MAX_CHAT_BUBBLE_WIDTH or 400
+			local textSize = existing.label.TextSize
+			local textBounds = textService:GetTextSize(message, textSize, existing.label.Font, Vector2.new(maxBubbleWidth, math.huge))
+			local newWidth = math.clamp(textBounds.X + 16, 60, maxBubbleWidth)
+			local newHeight = math.min(math.max(textBounds.Y + 12, 30), 120)
+			local mainFrame = existing.gui:FindFirstChild("BubbleFrame")
+			if mainFrame then
+				mainFrame.Size = UDim2.new(0, newWidth, 0, newHeight)
+				existing.gui.Size = UDim2.new(0, newWidth, 0, newHeight)
+			end
+		end
+		if existing.expireTask then task.cancel(existing.expireTask) end
+		local duration = math.min(math.max(#message * 0.12, 4), 30)
+		existing.expireTask = task.delay(duration, function()
+			if existing.gui and existing.gui.Parent then
+				local mf = existing.gui:FindFirstChild("BubbleFrame")
+				local tl = existing.gui:FindFirstChild("ChatText", true)
+				local st = mf and mf:FindFirstChildOfClass("UIStroke")
+				local fadeOut = TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+				if mf then TweenService:Create(mf, fadeOut, {BackgroundTransparency = 1}):Play() end
+				if tl then TweenService:Create(tl, fadeOut, {TextTransparency = 1}):Play() end
+				if st then TweenService:Create(st, fadeOut, {Transparency = 1}):Play() end
+				task.delay(0.25, function()
+					if existing.gui and existing.gui.Parent then existing.gui:Destroy() end
+					if activeChatBubbles[player] == existing then activeChatBubbles[player] = nil end
+				end)
+			else
+				if activeChatBubbles[player] == existing then activeChatBubbles[player] = nil end
+			end
+		end)
+		return
+	end
+
+	-- Build new bubble
+	do
+		local playerHeight = 2.2
+		if head then
+			local headSizeY = head.Size.Y
+			playerHeight = math.clamp(headSizeY / 2 + 1.5, 2.0, 3.6)
+		end
+
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "ChatBubble"
+		billboard.Size = UDim2.new(0, 300, 0, 60)
+		billboard.StudsOffset = Vector3.new(0, playerHeight, 0)
+		billboard.AlwaysOnTop = true
+		billboard.MaxDistance = 150
+		billboard.Adornee = head
+		billboard.Parent = head
+
+		local uiScale = Instance.new("UIScale")
+		uiScale.Scale = 1
+		uiScale.Parent = billboard
+
+		local connection
+		connection = RunService.RenderStepped:Connect(function()
+			if not player.Character then
+				if connection then connection:Disconnect() end
+				return
+			end
+			local withinDistance = isWithinBubbleDistance(player.Character)
+			billboard.Enabled = withinDistance
+			if withinDistance then
+				local camera = workspace.CurrentCamera
+				local root = player.Character:FindFirstChild("HumanoidRootPart")
+				if camera and root then
+					local dist = (camera.CFrame.Position - root.Position).Magnitude
+					uiScale.Scale = math.clamp(16 / math.max(dist, 1), 0.7, 1)
+				end
+			end
+		end)
+
+		local textService = game:GetService("TextService")
+		local maxBubbleWidth = _G.MAX_CHAT_BUBBLE_WIDTH or 400
+		local textSize = 15
+		local textBounds = textService:GetTextSize(message, textSize, Enum.Font.Gotham, Vector2.new(maxBubbleWidth, math.huge))
+		local finalWidth = math.clamp(textBounds.X + 16, 60, maxBubbleWidth)
+		local finalHeight = math.max(textBounds.Y + 12, 30)
+
+		if textBounds.Y > 96 then
+			textSize = 14
+			textBounds = textService:GetTextSize(message, textSize, Enum.Font.Gotham, Vector2.new(maxBubbleWidth, math.huge))
+			finalWidth = math.clamp(textBounds.X + 16, 60, maxBubbleWidth)
+			finalHeight = math.max(textBounds.Y + 12, 30)
+		end
+		finalHeight = math.min(finalHeight, 120)
+
+		billboard.Size = UDim2.new(0, finalWidth, 0, finalHeight)
+
+		local mainFrame = Instance.new("Frame")
+		mainFrame.Name = "BubbleFrame"
+		mainFrame.BackgroundColor3 = Color3.fromRGB(30, 32, 38)
+		mainFrame.BackgroundTransparency = 0.1
+		mainFrame.BorderSizePixel = 0
+		mainFrame.Size = UDim2.new(0, finalWidth, 0, finalHeight)
+		mainFrame.Position = UDim2.new(0.5, 0, 0, 0)
+		mainFrame.AnchorPoint = Vector2.new(0.5, 0)
+		mainFrame.Parent = billboard
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 10)
+		corner.Parent = mainFrame
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 1.5
+		stroke.Transparency = 0.2
+		stroke.Color = Color3.fromRGB(255, 255, 255)
+		stroke.Parent = mainFrame
+
+		do
+			local padding = Instance.new("UIPadding")
+			padding.PaddingLeft = UDim.new(0, 4)
+			padding.PaddingRight = UDim.new(0, 4)
+			padding.PaddingTop = UDim.new(0, 6)
+			padding.PaddingBottom = UDim.new(0, 6)
+			padding.Parent = mainFrame
+		end
+
+		local textLabel = Instance.new("TextLabel")
+		textLabel.Name = "ChatText"
+		textLabel.BackgroundTransparency = 1
+		textLabel.Font = Enum.Font.Gotham
+		textLabel.TextSize = textSize
+		textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		textLabel.TextXAlignment = Enum.TextXAlignment.Center
+		textLabel.TextYAlignment = Enum.TextYAlignment.Center
+		textLabel.Position = UDim2.new(0, 0, 0, 0)
+		textLabel.Size = UDim2.new(1, 0, 1, 0)
+		textLabel.TextWrapped = true
+		textLabel.Text = message
+		textLabel.Parent = mainFrame
+
+		activeChatBubbles[player] = { gui = billboard, label = textLabel, expireTask = nil }
+
+		mainFrame.BackgroundTransparency = 1
+		textLabel.TextTransparency = 1
+		stroke.Transparency = 1
+		mainFrame.Size = UDim2.new(0, finalWidth * 0.9, 0, finalHeight * 0.9)
+
+		task.defer(function()
+			local fadeIn = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			TweenService:Create(mainFrame, fadeIn, {BackgroundTransparency = 0.1, Size = UDim2.new(0, finalWidth, 0, finalHeight)}):Play()
+			TweenService:Create(textLabel, fadeIn, {TextTransparency = 0}):Play()
+			TweenService:Create(stroke, fadeIn, {Transparency = 0.2}):Play()
+		end)
+
+		local duration = math.min(math.max(#message * 0.12, 4), 30)
+		local expireTask = task.delay(duration, function()
+			if activeChatBubbles[player] and activeChatBubbles[player].gui == billboard then
+				local fadeOut = TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+				TweenService:Create(mainFrame, fadeOut, {BackgroundTransparency = 1, Size = UDim2.new(0, finalWidth * 0.9, 0, finalHeight * 0.9)}):Play()
+				TweenService:Create(textLabel, fadeOut, {TextTransparency = 1}):Play()
+				TweenService:Create(stroke, fadeOut, {Transparency = 1}):Play()
+				task.delay(0.25, function()
+					if billboard and billboard.Parent then billboard:Destroy() end
+					if activeChatBubbles[player] and activeChatBubbles[player].gui == billboard then
+						activeChatBubbles[player] = nil
+					end
+				end)
+			end
+		end)
+
+		activeChatBubbles[player].expireTask = expireTask
+
+		local character = player.Character
+		character.AncestryChanged:Connect(function()
+			if not character.Parent and activeChatBubbles[player] and activeChatBubbles[player].gui == billboard then
+				billboard:Destroy()
+				activeChatBubbles[player] = nil
+			end
+		end)
+	end
+end
+
+local function createStickerBubble(player, imageId)
+	if not player or not player.Character then return end
+	if not isWithinBubbleDistance(player.Character) then return end
+	local head = player.Character:FindFirstChild("Head")
+	if not head then return end
+
+	if activeChatBubbles[player] and activeChatBubbles[player].gui then
+		activeChatBubbles[player].gui:Destroy()
+		activeChatBubbles[player] = nil
+	end
+	for _, child in ipairs(head:GetChildren()) do
+		if child:IsA("BillboardGui") and child.Name == "StickerBubble" then
+			child:Destroy()
+		end
+	end
+
+	do
+		local BUBBLE_SIZE = 64
+		local IMAGE_SIZE = 44
+
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "StickerBubble"
+		billboard.Size = UDim2.new(0, BUBBLE_SIZE, 0, BUBBLE_SIZE)
+		billboard.StudsOffset = Vector3.new(0, 1.6, 0)
+		billboard.AlwaysOnTop = true
+		billboard.MaxDistance = 120
+		billboard.Adornee = head
+		billboard.Parent = head
+
+		local connection
+		connection = RunService.RenderStepped:Connect(function()
+			if not player.Character then
+				if connection then connection:Disconnect() end
+				return
+			end
+			billboard.Enabled = isWithinBubbleDistance(player.Character)
+		end)
+
+		local bubbleFrame = Instance.new("Frame")
+		bubbleFrame.BackgroundColor3 = Color3.fromRGB(30, 32, 38)
+		bubbleFrame.BackgroundTransparency = 0.1
+		bubbleFrame.BorderSizePixel = 0
+		bubbleFrame.Size = UDim2.new(1, 0, 1, 0)
+		bubbleFrame.Parent = billboard
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 16)
+		corner.Parent = bubbleFrame
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 1.5
+		stroke.Transparency = 0.2
+		stroke.Color = Color3.fromRGB(255, 255, 255)
+		stroke.Parent = bubbleFrame
+
+		local image = Instance.new("ImageLabel")
+		image.BackgroundTransparency = 1
+		image.Image = imageId
+		image.Size = UDim2.new(0, IMAGE_SIZE, 0, IMAGE_SIZE)
+		image.Position = UDim2.new(0.5, 0, 0.5, 0)
+		image.AnchorPoint = Vector2.new(0.5, 0.5)
+		image.Parent = bubbleFrame
+
+		bubbleFrame.Size = UDim2.new(0.85, 0, 0.85, 0)
+		bubbleFrame.BackgroundTransparency = 1
+		image.ImageTransparency = 1
+		stroke.Transparency = 1
+
+		task.defer(function()
+			local ti = TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+			TweenService:Create(bubbleFrame, ti, {Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 0.1}):Play()
+			TweenService:Create(image, ti, {ImageTransparency = 0}):Play()
+			TweenService:Create(stroke, ti, {Transparency = 0.2}):Play()
+		end)
+
+		task.delay(4, function()
+			if billboard and billboard.Parent then
+				local fadeOut = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+				TweenService:Create(bubbleFrame, fadeOut, {BackgroundTransparency = 1, Size = UDim2.new(0.85, 0, 0.85, 0)}):Play()
+				TweenService:Create(image, fadeOut, {ImageTransparency = 1}):Play()
+				TweenService:Create(stroke, fadeOut, {Transparency = 1}):Play()
+				task.delay(0.2, function()
+					if billboard and billboard.Parent then billboard:Destroy() end
+				end)
+			end
+		end)
+	end
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+	local data = activeChatBubbles[plr]
+	if data then
+		if data.expireTask then task.cancel(data.expireTask) end
+		if data.gui and data.gui.Parent then data.gui:Destroy() end
+		activeChatBubbles[plr] = nil
+	end
+	mutedPlayers[plr] = nil
+	mutedByOthers[plr] = nil
+	muteCooldowns[plr] = nil
+end)
+
+--------------------------------------------------------------------
+-- Thumbnail cache
+--------------------------------------------------------------------
+local thumbCache = {}
+local function getThumbnail(userId)
+	if thumbCache[userId] then return thumbCache[userId] end
+	local ok, content = pcall(function()
+		local url, _ = Players:GetUserThumbnailAsync(userId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+		return url
+	end)
+	if ok and content then
+		thumbCache[userId] = content
+		return content
+	end
+	return ""
+end
+
+--------------------------------------------------------------------
+-- UI CREATION
+--------------------------------------------------------------------
+print("SafetyChatClient: Creating UI...")
+
+local existingUI = playerGui:FindFirstChild("SafetyChatUI")
+if existingUI then existingUI:Destroy() end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "SafetyChatUI"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = false
+screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
+screenGui.Enabled = true
+screenGui.DisplayOrder = 100
+screenGui.Parent = playerGui
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+print("SafetyChatClient: ScreenGui created and parented to PlayerGui")
+
+local CHAT_BG_TRANSPARENCY = 0.15
+local TITLE_BG_TRANSPARENCY = 0.1
+local INPUT_BG_TRANSPARENCY = 0.2
+
+-- Toggle Button
+local chatToggleButton = Instance.new("ImageButton")
+chatToggleButton.Name = "ChatToggleButton"
+chatToggleButton.BackgroundTransparency = 0
+chatToggleButton.BackgroundColor3 = Color3.fromRGB(8, 8, 8)
+chatToggleButton.Image = "rbxassetid://127754907937521"
+chatToggleButton.ScaleType = Enum.ScaleType.Fit
+chatToggleButton.Size = UDim2.fromOffset(52, 52)
+chatToggleButton.Position = UDim2.new(0, 16, 0, 80)
+chatToggleButton.AutoButtonColor = false
+chatToggleButton.Visible = false
+chatToggleButton.Parent = screenGui
+
+do
+	local toggleCorner = Instance.new("UICorner")
+	toggleCorner.CornerRadius = UDim.new(1, 0)
+	toggleCorner.Parent = chatToggleButton
+
+	local toggleStroke = Instance.new("UIStroke")
+	toggleStroke.Thickness = 2
+	toggleStroke.Transparency = 0
+	toggleStroke.Color = Color3.fromRGB(5, 5, 6)
+	toggleStroke.Parent = chatToggleButton
+
+	chatToggleButton.ImageColor3 = Color3.fromRGB(255, 255, 255)
+end
+
+-- Main Chat Frame
+local chatFrame = Instance.new("Frame")
+chatFrame.Name = "ChatFrame"
+chatFrame.BackgroundColor3 = Color3.fromRGB(45, 47, 53)
+chatFrame.BackgroundTransparency = CHAT_BG_TRANSPARENCY
+chatFrame.BorderSizePixel = 0
+chatFrame.AnchorPoint = Vector2.new(0, 0)
+chatFrame.Position = UDim2.new(0, 16, 0, 80)
+chatFrame.Size = UDim2.new(0, 520, 0, 230)
+chatFrame.Visible = true
+chatFrame.ZIndex = 10
+chatFrame.Parent = screenGui
+
+--------------------------------------------------------------------
+-- SETTINGS PANEL
+--------------------------------------------------------------------
+local settingsPanel = Instance.new("ScrollingFrame")
+settingsPanel.CanvasSize = UDim2.new(0, 0, 0, 600)
+settingsPanel.ScrollBarThickness = 4
+settingsPanel.ScrollBarImageTransparency = 0.5
+settingsPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+settingsPanel.Name = "ChatSettingsPanel"
+settingsPanel.BackgroundColor3 = Color3.fromRGB(35, 37, 43)
+settingsPanel.BackgroundTransparency = 0.1
+settingsPanel.BorderSizePixel = 0
+settingsPanel.Size = UDim2.new(0, 260, 0, 230)
+settingsPanel.Position = UDim2.new(1, 20, 0, 80)
+settingsPanel.ZIndex = 20
+settingsPanel.Parent = screenGui
+
+local settingsOpen = false
+
+toggleSettingsPanel = function()
+	if settingsOpen then
+		createSmoothTween(settingsPanel, {Position = UDim2.new(1, 30, 0, 80), BackgroundTransparency = 0.2}, 0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		settingsOpen = false
+	else
+		closeAllSidePanels("settings")
+		settingsPanel.BackgroundTransparency = 1
+		settingsPanel.Position = UDim2.new(1, 40, 0, 80)
+		createSmoothTween(settingsPanel, {Position = UDim2.new(1, -270, 0, 80), BackgroundTransparency = 0.1}, 0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		settingsOpen = true
+	end
+end
+
+do
+	local settingsCorner = Instance.new("UICorner")
+	settingsCorner.CornerRadius = UDim.new(0, 16)
+	settingsCorner.Parent = settingsPanel
+
+	local settingsStroke = Instance.new("UIStroke")
+	settingsStroke.Thickness = 1.5
+	settingsStroke.Transparency = 0.2
+	settingsStroke.Color = Color3.fromRGB(255, 255, 255)
+	settingsStroke.Parent = settingsPanel
+end
+
+local settingsTitle = Instance.new("TextLabel")
+settingsTitle.BackgroundTransparency = 1
+settingsTitle.Text = "Chat Customization"
+settingsTitle.Font = Enum.Font.GothamBold
+settingsTitle.TextSize = 16
+settingsTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+settingsTitle.Size = UDim2.new(1, -20, 0, 28)
+settingsTitle.Position = UDim2.new(0, 10, 0, 6)
+settingsTitle.TextXAlignment = Enum.TextXAlignment.Left
+settingsTitle.ZIndex = 21
+settingsTitle.Parent = settingsPanel
+
+local transparencySlider = Instance.new("TextButton")
+transparencySlider.Name = "ChatTransparencySlider"
+transparencySlider.Text = "Chat Transparency: 0.15"
+transparencySlider.Size = UDim2.new(1, -20, 0, 28)
+transparencySlider.Position = UDim2.new(0, 10, 0, 40)
+transparencySlider.BackgroundColor3 = Color3.fromRGB(55, 57, 63)
+transparencySlider.TextColor3 = Color3.fromRGB(255, 255, 255)
+transparencySlider.AutoButtonColor = false
+transparencySlider.ZIndex = 22
+transparencySlider.Parent = settingsPanel
+
+do
+	local transCorner = Instance.new("UICorner")
+	transCorner.CornerRadius = UDim.new(0, 10)
+	transCorner.Parent = transparencySlider
+
+	local transStroke = Instance.new("UIStroke")
+	transStroke.Thickness = 1
+	transStroke.Transparency = 0.3
+	transStroke.Color = Color3.fromRGB(255, 255, 255)
+	transStroke.Parent = transparencySlider
+end
+
+local transBaseColor = transparencySlider.BackgroundColor3
+transparencySlider.MouseEnter:Connect(function()
+	createSmoothTween(transparencySlider, {BackgroundColor3 = Color3.fromRGB(65, 67, 73)}, 0.15)
+end)
+transparencySlider.MouseLeave:Connect(function()
+	createSmoothTween(transparencySlider, {BackgroundColor3 = transBaseColor}, 0.15)
+end)
+
+-- Forward declarations needed before saveSettings / resetButton
+local chatBackgroundColor = Color3.fromRGB(45, 47, 53)
+local systemMessageColor = Color3.fromRGB(50, 62, 90)
+local systemTextColor = Color3.fromRGB(190, 210, 255)
+
+local rgbEnabled = false
+local rgbConnection = nil
+local rgbBackgroundEnabled = false
+local rgbBackgroundConnection = nil
+local rgbSystemBgEnabled = false
+local rgbSystemBgConnection = nil
+local rgbSystemTextEnabled = false
+local rgbSystemTextConnection = nil
+
+-- Forward-declare UI refs that resetButton needs (filled in below)
+local bgRGBButton, bgColorButton
+local sysBgRGBButton, sysBgColorButton
+local sysTextRGBButton, sysTextColorButton
+local rgbButton, chatStroke
+local messagesFrame
+
+local function saveSettings() end -- stub, overwritten below
+
+--------------------------------------------------------------------
+-- Advanced label
+--------------------------------------------------------------------
+do
+	local advancedLabel = Instance.new("TextLabel")
+	advancedLabel.BackgroundTransparency = 1
+	advancedLabel.Text = "Advanced Customization"
+	advancedLabel.Font = Enum.Font.GothamBold
+	advancedLabel.TextSize = 14
+	advancedLabel.TextColor3 = Color3.fromRGB(200, 220, 255)
+	advancedLabel.Size = UDim2.new(1, -20, 0, 22)
+	advancedLabel.Position = UDim2.new(0, 10, 0, 75)
+	advancedLabel.TextXAlignment = Enum.TextXAlignment.Left
+	advancedLabel.Parent = settingsPanel
+end
+
+--------------------------------------------------------------------
+-- RESET BUTTON
+--------------------------------------------------------------------
+local resetButton = Instance.new("TextButton")
+resetButton.Name = "ResetChatUI"
+resetButton.Text = "Reset Defaults"
+resetButton.Size = UDim2.new(1, -20, 0, 28)
+resetButton.Position = UDim2.new(0, 10, 0, 170)
+resetButton.BackgroundColor3 = Color3.fromRGB(60, 30, 30)
+resetButton.TextColor3 = Color3.fromRGB(255, 200, 200)
+resetButton.Font = Enum.Font.GothamBold
+resetButton.TextSize = 14
+resetButton.AutoButtonColor = false
+resetButton.ZIndex = 22
+resetButton.Parent = settingsPanel
+
+do
+	local resetCorner = Instance.new("UICorner")
+	resetCorner.CornerRadius = UDim.new(0, 10)
+	resetCorner.Parent = resetButton
+end
+
+--------------------------------------------------------------------
+-- BACKGROUND COLOR PICKER
+--------------------------------------------------------------------
+bgColorButton = Instance.new("TextButton")
+bgColorButton.Name = "BGColorPicker"
+bgColorButton.Text = "Chat Background Color"
+bgColorButton.Size = UDim2.new(1, -80, 0, 28)
+bgColorButton.Position = UDim2.new(0, 10, 0, 200)
+bgColorButton.BackgroundColor3 = Color3.fromRGB(55, 57, 63)
+bgColorButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+bgColorButton.TextSize = 11
+bgColorButton.TextStrokeTransparency = 0.85
+bgColorButton.AutoButtonColor = false
+bgColorButton.ZIndex = 22
+bgColorButton.Parent = settingsPanel
+
+bgRGBButton = Instance.new("TextButton")
+bgRGBButton.Name = "BGRGBToggle"
+bgRGBButton.Text = "🎨 RGB"
+bgRGBButton.Size = UDim2.new(0, 50, 0, 28)
+bgRGBButton.Position = UDim2.new(1, -55, 0, 200)
+bgRGBButton.BackgroundColor3 = Color3.fromRGB(55, 57, 63)
+bgRGBButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+bgRGBButton.TextSize = 11
+bgRGBButton.AutoButtonColor = false
+bgRGBButton.ZIndex = 23
+bgRGBButton.Parent = settingsPanel
+
+do
+	local bgRGBCorner = Instance.new("UICorner")
+	bgRGBCorner.CornerRadius = UDim.new(0, 10)
+	bgRGBCorner.Parent = bgRGBButton
+
+	local bgColorCorner = Instance.new("UICorner")
+	bgColorCorner.CornerRadius = UDim.new(0, 10)
+	bgColorCorner.Parent = bgColorButton
+
+	local bgRGBStroke = Instance.new("UIStroke")
+	bgRGBStroke.Thickness = 1
+	bgRGBStroke.Transparency = 0.3
+	bgRGBStroke.Color = Color3.fromRGB(255, 255, 255)
+	bgRGBStroke.Parent = bgRGBButton
+end
+
+-- Color picker dropdown
+local bgColorPickerFrame = Instance.new("Frame")
+bgColorPickerFrame.Name = "BGColorPickerFrame"
+bgColorPickerFrame.BackgroundColor3 = Color3.fromRGB(25, 27, 33)
+bgColorPickerFrame.BackgroundTransparency = 0.05
+bgColorPickerFrame.BorderSizePixel = 0
+bgColorPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+bgColorPickerFrame.Position = UDim2.new(0, 10, 0, 230)
+bgColorPickerFrame.Visible = false
+bgColorPickerFrame.ZIndex = 30
+bgColorPickerFrame.Parent = settingsPanel
+
+do
+	local bgPickerCorner = Instance.new("UICorner")
+	bgPickerCorner.CornerRadius = UDim.new(0, 12)
+	bgPickerCorner.Parent = bgColorPickerFrame
+
+	local bgColorGrid = Instance.new("UIGridLayout")
+	bgColorGrid.CellPadding = UDim2.new(0, 6, 0, 6)
+	bgColorGrid.CellSize = UDim2.new(0, 30, 0, 30)
+	bgColorGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	bgColorGrid.VerticalAlignment = Enum.VerticalAlignment.Center
+	bgColorGrid.StartCorner = Enum.StartCorner.TopLeft
+	bgColorGrid.Parent = bgColorPickerFrame
+
+	local bgColorPadding = Instance.new("UIPadding")
+	bgColorPadding.PaddingTop = UDim.new(0, 10)
+	bgColorPadding.PaddingBottom = UDim.new(0, 10)
+	bgColorPadding.PaddingLeft = UDim.new(0, 10)
+	bgColorPadding.PaddingRight = UDim.new(0, 10)
+	bgColorPadding.Parent = bgColorPickerFrame
+end
+
+local bgPickerOpen = false
+local function toggleBGColorPicker(show)
+	if bgPickerOpen == show then return end
+	bgPickerOpen = show
+	if show then
+		bgColorPickerFrame.Visible = true
+		bgColorPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+		bgColorPickerFrame.BackgroundTransparency = 1
+		createSmoothTween(bgColorPickerFrame, {BackgroundTransparency = 0.05, Size = UDim2.new(0, 220, 0, 180)}, 0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	else
+		createSmoothTween(bgColorPickerFrame, {BackgroundTransparency = 1, Size = UDim2.new(0, 0, 0, 0)}, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function()
+			bgColorPickerFrame.Visible = false
+		end)
+	end
+end
+
+do
+	local presetColors = {
+		Color3.fromRGB(45,47,53), Color3.fromRGB(60,62,68), Color3.fromRGB(80,82,88),
+		Color3.fromRGB(70,90,120), Color3.fromRGB(90,70,120), Color3.fromRGB(120,70,70),
+		Color3.fromRGB(70,120,70), Color3.fromRGB(120,110,70), Color3.fromRGB(70,110,120),
+		Color3.fromRGB(100,80,120), Color3.fromRGB(120,80,80), Color3.fromRGB(50,50,50),
+	}
+	for i, color in ipairs(presetColors) do
+		local colorBtn = Instance.new("TextButton")
+		colorBtn.Name = "ColorPreset_" .. i
+		colorBtn.BackgroundColor3 = color
+		colorBtn.BackgroundTransparency = 0
+		colorBtn.Size = UDim2.new(0, 30, 0, 30)
+		colorBtn.AutoButtonColor = false
+		colorBtn.Text = ""
+		colorBtn.ZIndex = 31
+		colorBtn.Parent = bgColorPickerFrame
+		local btnCorner = Instance.new("UICorner")
+		btnCorner.CornerRadius = UDim.new(0, 8)
+		btnCorner.Parent = colorBtn
+		local btnStroke = Instance.new("UIStroke")
+		btnStroke.Thickness = 1
+		btnStroke.Transparency = 0.5
+		btnStroke.Color = Color3.fromRGB(255, 255, 255)
+		btnStroke.Parent = colorBtn
+		colorBtn.MouseButton1Click:Connect(function()
+			if rgbBackgroundEnabled then
+				rgbBackgroundEnabled = false
+				bgRGBButton.Text = "🎨 RGB"
+				bgRGBButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+				if rgbBackgroundConnection then rgbBackgroundConnection:Disconnect(); rgbBackgroundConnection = nil end
+			end
+			chatBackgroundColor = color
+			chatFrame.BackgroundColor3 = color
+			bgColorButton.BackgroundColor3 = color
+			toggleBGColorPicker(false)
+			saveSettings()
+		end)
+	end
+end
+
+bgColorButton.MouseButton1Click:Connect(function()
+	toggleBGColorPicker(not bgPickerOpen)
+end)
+
+bgRGBButton.MouseButton1Click:Connect(function()
+	rgbBackgroundEnabled = not rgbBackgroundEnabled
+	if rgbBackgroundEnabled then
+		bgRGBButton.Text = "✨ RGB"
+		bgRGBButton.TextColor3 = Color3.fromRGB(100, 255, 200)
+		toggleBGColorPicker(false)
+		local hue = 0
+		rgbBackgroundConnection = RunService.RenderStepped:Connect(function(dt)
+			hue = (hue + dt * 0.3) % 1
+			local color = Color3.fromHSV(hue, 0.8, 0.3)
+			if chatFrame then chatFrame.BackgroundColor3 = color end
+			if bgColorButton and bgColorButton.Parent then bgColorButton.BackgroundColor3 = color end
+		end)
+	else
+		bgRGBButton.Text = "🎨 RGB"
+		bgRGBButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+		if rgbBackgroundConnection then rgbBackgroundConnection:Disconnect(); rgbBackgroundConnection = nil end
+		if chatFrame then chatFrame.BackgroundColor3 = chatBackgroundColor end
+		if bgColorButton and bgColorButton.Parent then bgColorButton.BackgroundColor3 = chatBackgroundColor end
+	end
+	saveSettings()
+end)
+
+--------------------------------------------------------------------
+-- UPDATE SYSTEM MESSAGE COLORS (defined here so RGB loops can call it)
+--------------------------------------------------------------------
+local function updateSystemMessageColors()
+	local cf = screenGui:FindFirstChild("ChatFrame")
+	if not cf then return end
+	local mf = cf:FindFirstChild("Messages")
+	if not mf then return end
+	for _, child in ipairs(mf:GetChildren()) do
+		if child:IsA("Frame") then
+			local usernameLabel = child:FindFirstChildWhichIsA("TextButton")
+			if usernameLabel and usernameLabel.Text and usernameLabel.Text:find("%[SYSTEM%]") then
+				child.BackgroundColor3 = systemMessageColor
+				for _, descendant in ipairs(child:GetDescendants()) do
+					if descendant:IsA("TextLabel") and descendant ~= usernameLabel then
+						descendant.TextColor3 = systemTextColor
+						break
+					end
+				end
+				usernameLabel.TextColor3 = systemTextColor
+			end
+		end
+	end
+end
+
+--------------------------------------------------------------------
+-- SYSTEM MESSAGE COLOR BUTTONS
+-- (sysBgColorButton, sysBgRGBButton, sysTextColorButton, sysTextRGBButton)
+-- Defined in a do-block to limit locals
+--------------------------------------------------------------------
+do
+	sysBgColorButton = Instance.new("TextButton")
+	sysBgColorButton.Name = "SysBgColorPicker"
+	sysBgColorButton.Text = "System Message BG"
+	sysBgColorButton.Size = UDim2.new(1, -80, 0, 28)
+	sysBgColorButton.Position = UDim2.new(0, 10, 0, 235)
+	sysBgColorButton.BackgroundColor3 = systemMessageColor
+	sysBgColorButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	sysBgColorButton.TextSize = 11
+	sysBgColorButton.AutoButtonColor = false
+	sysBgColorButton.ZIndex = 22
+	sysBgColorButton.Parent = settingsPanel
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,10); c.Parent = sysBgColorButton
+
+	sysBgRGBButton = Instance.new("TextButton")
+	sysBgRGBButton.Name = "SysBgRGBToggle"
+	sysBgRGBButton.Text = "🎨 RGB"
+	sysBgRGBButton.Size = UDim2.new(0, 50, 0, 28)
+	sysBgRGBButton.Position = UDim2.new(1, -55, 0, 235)
+	sysBgRGBButton.BackgroundColor3 = Color3.fromRGB(55, 57, 63)
+	sysBgRGBButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	sysBgRGBButton.TextSize = 11
+	sysBgRGBButton.AutoButtonColor = false
+	sysBgRGBButton.ZIndex = 23
+	sysBgRGBButton.Parent = settingsPanel
+	local c2 = Instance.new("UICorner"); c2.CornerRadius = UDim.new(0,10); c2.Parent = sysBgRGBButton
+	local s2 = Instance.new("UIStroke"); s2.Thickness = 1; s2.Transparency = 0.3; s2.Color = Color3.fromRGB(255,255,255); s2.Parent = sysBgRGBButton
+
+	sysTextColorButton = Instance.new("TextButton")
+	sysTextColorButton.Name = "SysTextColorPicker"
+	sysTextColorButton.Text = "System Text Color"
+	sysTextColorButton.Size = UDim2.new(1, -80, 0, 28)
+	sysTextColorButton.Position = UDim2.new(0, 10, 0, 270)
+	sysTextColorButton.BackgroundColor3 = systemTextColor
+	sysTextColorButton.TextColor3 = Color3.fromRGB(0, 0, 0)
+	sysTextColorButton.TextSize = 11
+	sysTextColorButton.AutoButtonColor = false
+	sysTextColorButton.ZIndex = 22
+	sysTextColorButton.Parent = settingsPanel
+	local c3 = Instance.new("UICorner"); c3.CornerRadius = UDim.new(0,10); c3.Parent = sysTextColorButton
+
+	sysTextRGBButton = Instance.new("TextButton")
+	sysTextRGBButton.Name = "SysTextRGBToggle"
+	sysTextRGBButton.Text = "🎨 RGB"
+	sysTextRGBButton.Size = UDim2.new(0, 50, 0, 28)
+	sysTextRGBButton.Position = UDim2.new(1, -55, 0, 270)
+	sysTextRGBButton.BackgroundColor3 = Color3.fromRGB(55, 57, 63)
+	sysTextRGBButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	sysTextRGBButton.TextSize = 11
+	sysTextRGBButton.AutoButtonColor = false
+	sysTextRGBButton.ZIndex = 23
+	sysTextRGBButton.Parent = settingsPanel
+	local c4 = Instance.new("UICorner"); c4.CornerRadius = UDim.new(0,10); c4.Parent = sysTextRGBButton
+	local s4 = Instance.new("UIStroke"); s4.Thickness = 1; s4.Transparency = 0.3; s4.Color = Color3.fromRGB(255,255,255); s4.Parent = sysTextRGBButton
+
+	sysBgRGBButton.MouseButton1Click:Connect(function()
+		rgbSystemBgEnabled = not rgbSystemBgEnabled
+		if rgbSystemBgEnabled then
+			sysBgRGBButton.Text = "✨ RGB"
+			sysBgRGBButton.TextColor3 = Color3.fromRGB(100, 255, 200)
+			local hue = 0
+			rgbSystemBgConnection = RunService.RenderStepped:Connect(function(dt)
+				hue = (hue + dt * 0.3) % 1
+				systemMessageColor = Color3.fromHSV(hue, 0.6, 0.4)
+				if sysBgColorButton and sysBgColorButton.Parent then
+					sysBgColorButton.BackgroundColor3 = systemMessageColor
+				end
+				updateSystemMessageColors()
+			end)
+		else
+			sysBgRGBButton.Text = "🎨 RGB"
+			sysBgRGBButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+			if rgbSystemBgConnection then rgbSystemBgConnection:Disconnect(); rgbSystemBgConnection = nil end
+		end
+		saveSettings()
+	end)
+
+	sysTextRGBButton.MouseButton1Click:Connect(function()
+		rgbSystemTextEnabled = not rgbSystemTextEnabled
+		if rgbSystemTextEnabled then
+			sysTextRGBButton.Text = "✨ RGB"
+			sysTextRGBButton.TextColor3 = Color3.fromRGB(100, 255, 200)
+			local hue = 0
+			rgbSystemTextConnection = RunService.RenderStepped:Connect(function(dt)
+				hue = (hue + dt * 0.3) % 1
+				systemTextColor = Color3.fromHSV(hue, 0.7, 1)
+				if sysTextColorButton and sysTextColorButton.Parent then
+					sysTextColorButton.BackgroundColor3 = systemTextColor
+				end
+				updateSystemMessageColors()
+			end)
+		else
+			sysTextRGBButton.Text = "🎨 RGB"
+			sysTextRGBButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+			if rgbSystemTextConnection then rgbSystemTextConnection:Disconnect(); rgbSystemTextConnection = nil end
+		end
+		saveSettings()
+	end)
+
+	-- System BG color picker frame
+	local sysBgPickerFrame = Instance.new("Frame")
+	sysBgPickerFrame.Name = "SysBgPickerFrame"
+	sysBgPickerFrame.BackgroundColor3 = Color3.fromRGB(25, 27, 33)
+	sysBgPickerFrame.BackgroundTransparency = 0.05
+	sysBgPickerFrame.BorderSizePixel = 0
+	sysBgPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+	sysBgPickerFrame.Position = UDim2.new(0, 10, 0, 300)
+	sysBgPickerFrame.Visible = false
+	sysBgPickerFrame.ZIndex = 30
+	sysBgPickerFrame.Parent = settingsPanel
+	local sysBgPickerCorner = Instance.new("UICorner"); sysBgPickerCorner.CornerRadius = UDim.new(0,12); sysBgPickerCorner.Parent = sysBgPickerFrame
+	local sysBgGrid = Instance.new("UIGridLayout"); sysBgGrid.CellPadding = UDim2.new(0,6,0,6); sysBgGrid.CellSize = UDim2.new(0,30,0,30); sysBgGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center; sysBgGrid.VerticalAlignment = Enum.VerticalAlignment.Center; sysBgGrid.StartCorner = Enum.StartCorner.TopLeft; sysBgGrid.Parent = sysBgPickerFrame
+	local sysBgPad = Instance.new("UIPadding"); sysBgPad.PaddingTop = UDim.new(0,10); sysBgPad.PaddingBottom = UDim.new(0,10); sysBgPad.PaddingLeft = UDim.new(0,10); sysBgPad.PaddingRight = UDim.new(0,10); sysBgPad.Parent = sysBgPickerFrame
+
+	local sysBgPickerOpen = false
+	local function toggleSysBgPicker(show)
+		if sysBgPickerOpen == show then return end
+		sysBgPickerOpen = show
+		if show then
+			sysBgPickerFrame.Visible = true
+			sysBgPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+			sysBgPickerFrame.BackgroundTransparency = 1
+			createSmoothTween(sysBgPickerFrame, {BackgroundTransparency = 0.05, Size = UDim2.new(0, 220, 0, 180)}, 0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		else
+			createSmoothTween(sysBgPickerFrame, {BackgroundTransparency = 1, Size = UDim2.new(0, 0, 0, 0)}, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function()
+				sysBgPickerFrame.Visible = false
+			end)
+		end
+	end
+
+	local sysBgPresetColors = {
+		Color3.fromRGB(50,62,90), Color3.fromRGB(70,90,120), Color3.fromRGB(80,82,88),
+		Color3.fromRGB(120,70,70), Color3.fromRGB(70,120,70), Color3.fromRGB(120,110,70),
+		Color3.fromRGB(90,70,120), Color3.fromRGB(70,110,120), Color3.fromRGB(130,80,50),
+		Color3.fromRGB(50,80,130), Color3.fromRGB(110,50,110), Color3.fromRGB(60,60,60),
+	}
+	for i, color in ipairs(sysBgPresetColors) do
+		local btn = Instance.new("TextButton"); btn.BackgroundColor3 = color; btn.BackgroundTransparency = 0
+		btn.Size = UDim2.new(0,30,0,30); btn.AutoButtonColor = false; btn.Text = ""; btn.ZIndex = 31; btn.Parent = sysBgPickerFrame
+		local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0,8); bc.Parent = btn
+		local bs = Instance.new("UIStroke"); bs.Thickness = 1; bs.Transparency = 0.5; bs.Color = Color3.fromRGB(255,255,255); bs.Parent = btn
+		btn.MouseButton1Click:Connect(function()
+			if rgbSystemBgEnabled then
+				rgbSystemBgEnabled = false
+				sysBgRGBButton.Text = "🎨 RGB"; sysBgRGBButton.TextColor3 = Color3.fromRGB(200,200,200)
+				if rgbSystemBgConnection then rgbSystemBgConnection:Disconnect(); rgbSystemBgConnection = nil end
+			end
+			systemMessageColor = color
+			sysBgColorButton.BackgroundColor3 = color
+			updateSystemMessageColors()
+			toggleSysBgPicker(false)
+			saveSettings()
+		end)
+	end
+
+	sysBgColorButton.MouseButton1Click:Connect(function()
+		toggleSysBgPicker(not sysBgPickerOpen)
+	end)
+
+	-- System Text color picker frame
+	local sysTextPickerFrame = Instance.new("Frame")
+	sysTextPickerFrame.Name = "SysTextPickerFrame"
+	sysTextPickerFrame.BackgroundColor3 = Color3.fromRGB(25, 27, 33)
+	sysTextPickerFrame.BackgroundTransparency = 0.05
+	sysTextPickerFrame.BorderSizePixel = 0
+	sysTextPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+	sysTextPickerFrame.Position = UDim2.new(0, 10, 0, 305)
+	sysTextPickerFrame.Visible = false
+	sysTextPickerFrame.ZIndex = 30
+	sysTextPickerFrame.Parent = settingsPanel
+	local sysTextPickerCorner = Instance.new("UICorner"); sysTextPickerCorner.CornerRadius = UDim.new(0,12); sysTextPickerCorner.Parent = sysTextPickerFrame
+	local sysTextGrid = Instance.new("UIGridLayout"); sysTextGrid.CellPadding = UDim2.new(0,6,0,6); sysTextGrid.CellSize = UDim2.new(0,30,0,30); sysTextGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center; sysTextGrid.VerticalAlignment = Enum.VerticalAlignment.Center; sysTextGrid.StartCorner = Enum.StartCorner.TopLeft; sysTextGrid.Parent = sysTextPickerFrame
+	local sysTextPad = Instance.new("UIPadding"); sysTextPad.PaddingTop = UDim.new(0,10); sysTextPad.PaddingBottom = UDim.new(0,10); sysTextPad.PaddingLeft = UDim.new(0,10); sysTextPad.PaddingRight = UDim.new(0,10); sysTextPad.Parent = sysTextPickerFrame
+
+	local sysTextPickerOpen = false
+	local function toggleSysTextPicker(show)
+		if sysTextPickerOpen == show then return end
+		sysTextPickerOpen = show
+		if show then
+			sysTextPickerFrame.Visible = true
+			sysTextPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+			sysTextPickerFrame.BackgroundTransparency = 1
+			createSmoothTween(sysTextPickerFrame, {BackgroundTransparency = 0.05, Size = UDim2.new(0, 220, 0, 180)}, 0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		else
+			createSmoothTween(sysTextPickerFrame, {BackgroundTransparency = 1, Size = UDim2.new(0, 0, 0, 0)}, 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function()
+				sysTextPickerFrame.Visible = false
+			end)
+		end
+	end
+
+	local sysTextPresetColors = {
+		Color3.fromRGB(190,210,255), Color3.fromRGB(255,255,255), Color3.fromRGB(200,255,200),
+		Color3.fromRGB(255,220,180), Color3.fromRGB(255,180,180), Color3.fromRGB(180,220,255),
+		Color3.fromRGB(220,180,255), Color3.fromRGB(255,255,180), Color3.fromRGB(180,255,220),
+		Color3.fromRGB(255,200,230), Color3.fromRGB(200,230,255), Color3.fromRGB(230,230,230),
+	}
+	for i, color in ipairs(sysTextPresetColors) do
+		local btn = Instance.new("TextButton"); btn.BackgroundColor3 = color; btn.BackgroundTransparency = 0
+		btn.Size = UDim2.new(0,30,0,30); btn.AutoButtonColor = false; btn.Text = ""; btn.ZIndex = 31; btn.Parent = sysTextPickerFrame
+		local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0,8); bc.Parent = btn
+		local bs = Instance.new("UIStroke"); bs.Thickness = 1; bs.Transparency = 0.5; bs.Color = Color3.fromRGB(255,255,255); bs.Parent = btn
+		btn.MouseButton1Click:Connect(function()
+			if rgbSystemTextEnabled then
+				rgbSystemTextEnabled = false
+				sysTextRGBButton.Text = "🎨 RGB"; sysTextRGBButton.TextColor3 = Color3.fromRGB(200,200,200)
+				if rgbSystemTextConnection then rgbSystemTextConnection:Disconnect(); rgbSystemTextConnection = nil end
+			end
+			systemTextColor = color
+			sysTextColorButton.BackgroundColor3 = color
+			sysTextColorButton.TextColor3 = Color3.fromRGB(0, 0, 0)
+			updateSystemMessageColors()
+			toggleSysTextPicker(false)
+			saveSettings()
+		end)
+	end
+
+	sysTextColorButton.MouseButton1Click:Connect(function()
+		toggleSysTextPicker(not sysTextPickerOpen)
+	end)
+end
+
+--------------------------------------------------------------------
+-- UPDATE SYSTEM MESSAGE COLORS
+--------------------------------------------------------------------
+local function updateSystemMessageColors()
+	local cf = screenGui:FindFirstChild("ChatFrame")
+	if not cf then return end
+	local mf = cf:FindFirstChild("Messages")
+	if not mf then return end
+	for _, child in ipairs(mf:GetChildren()) do
+		if child:IsA("Frame") then
+			local usernameLabel = child:FindFirstChildWhichIsA("TextButton")
+			if usernameLabel and usernameLabel.Text and usernameLabel.Text:find("%[SYSTEM%]") then
+				child.BackgroundColor3 = systemMessageColor
+				for _, descendant in ipairs(child:GetDescendants()) do
+					if descendant:IsA("TextLabel") and descendant ~= usernameLabel then
+						descendant.TextColor3 = systemTextColor
+						break
+					end
+				end
+				usernameLabel.TextColor3 = systemTextColor
+			end
+		end
+	end
+end
+
+--------------------------------------------------------------------
+-- MOBILE SCALE + CHAT FRAME DECORATIONS
+--------------------------------------------------------------------
+do
+	local uiScale = Instance.new("UIScale")
+	uiScale.Name = "ChatUIScale"
+
+	local function isMobile()
+		local viewportX = workspace.CurrentCamera.ViewportSize.X
+		local isTouchDevice = UserInputService.TouchEnabled
+			and not UserInputService.KeyboardEnabled
+			and not UserInputService.MouseEnabled
+		return isTouchDevice or viewportX < 600
+	end
+
+	local function updateScale()
+		uiScale.Scale = isMobile() and 0.55 or 1
+	end
+
+	updateScale()
+	uiScale.Parent = chatFrame
+
+	workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+	UserInputService:GetPropertyChangedSignal("TouchEnabled"):Connect(updateScale)
+end
+
+local chatCorner = Instance.new("UICorner")
+chatCorner.CornerRadius = UDim.new(0, 14)
+chatCorner.Parent = chatFrame
+
+chatStroke = Instance.new("UIStroke")
+chatStroke.Thickness = 1
+chatStroke.Transparency = 0.3
+chatStroke.Color = Color3.fromRGB(255, 255, 255)
+chatStroke.Parent = chatFrame
+_G.REAL_CHAT_STROKE = chatStroke
+
+--------------------------------------------------------------------
+-- AUTOSAVE
+--------------------------------------------------------------------
+local ChatSettingsRemote = ReplicatedStorage:WaitForChild("ChatSettingsRemote", 10)
+
+saveSettings = function()
+	if not ChatSettingsRemote then return end
+	pcall(function()
+		ChatSettingsRemote:InvokeServer("save", {
+			transparency = CHAT_BG_TRANSPARENCY,
+			bgColorR = chatBackgroundColor.R,
+			bgColorG = chatBackgroundColor.G,
+			bgColorB = chatBackgroundColor.B,
+			rgbEnabled = rgbEnabled and true or false,
+			rgbBgEnabled = rgbBackgroundEnabled and true or false,
+			outlineThickness = _G.RGB_OUTLINE_THICKNESS,
+			sysBgColorR = systemMessageColor.R,
+			sysBgColorG = systemMessageColor.G,
+			sysBgColorB = systemMessageColor.B,
+			rgbSysBgEnabled = rgbSystemBgEnabled and true or false,
+			sysTextColorR = systemTextColor.R,
+			sysTextColorG = systemTextColor.G,
+			sysTextColorB = systemTextColor.B,
+			rgbSysTextEnabled = rgbSystemTextEnabled and true or false,
+		})
+	end)
+end
+
+local function loadSettings()
+	if not ChatSettingsRemote then return end
+	local ok, data = pcall(function() return ChatSettingsRemote:InvokeServer("load") end)
+	if not ok or not data then return end
+	if data.transparency then
+		CHAT_BG_TRANSPARENCY = data.transparency
+		chatFrame.BackgroundTransparency = CHAT_BG_TRANSPARENCY
+		transparencySlider.Text = "Chat Transparency: " .. string.format("%.2f", CHAT_BG_TRANSPARENCY)
+	end
+	if data.bgColorR then
+		chatBackgroundColor = Color3.new(data.bgColorR, data.bgColorG, data.bgColorB)
+		chatFrame.BackgroundColor3 = chatBackgroundColor
+		bgColorButton.BackgroundColor3 = chatBackgroundColor
+	end
+	if data.outlineThickness then
+		_G.RGB_OUTLINE_THICKNESS = data.outlineThickness
+		chatStroke.Thickness = _G.RGB_OUTLINE_THICKNESS
+		if _G.THICKNESS_BUTTON then
+			_G.THICKNESS_BUTTON.Text = "Outline Thickness: " .. tostring(_G.RGB_OUTLINE_THICKNESS)
+		end
+	end
+	if data.rgbEnabled then
+		task.delay(0.5, function()
+			rgbEnabled = true
+			_G.RGB_BUBBLES_ENABLED = true
+			if rgbButton then rgbButton.Text = "Disable RGB Border" end
+			if rgbConnection then rgbConnection:Disconnect(); rgbConnection = nil end
+			local hue = 0
+			rgbConnection = RunService.RenderStepped:Connect(function(dt)
+				hue = (hue + dt * 0.4) % 1
+				local color = Color3.fromHSV(hue, 1, 1)
+				if chatStroke then
+					chatStroke.Color = color
+					chatStroke.Transparency = 0.3
+					chatStroke.Thickness = _G.RGB_OUTLINE_THICKNESS
+				end
+			end)
+		end)
+	end
+	if data.rgbBgEnabled then
+		task.delay(0.5, function()
+			rgbBackgroundEnabled = true
+			if bgRGBButton then bgRGBButton.Text = "✨ RGB"; bgRGBButton.TextColor3 = Color3.fromRGB(100, 255, 200) end
+			if rgbBackgroundConnection then rgbBackgroundConnection:Disconnect(); rgbBackgroundConnection = nil end
+			local hue = 0
+			rgbBackgroundConnection = RunService.RenderStepped:Connect(function(dt)
+				hue = (hue + dt * 0.3) % 1
+				local color = Color3.fromHSV(hue, 0.8, 0.3)
+				if chatFrame then chatFrame.BackgroundColor3 = color end
+				if bgColorButton and bgColorButton.Parent then bgColorButton.BackgroundColor3 = color end
+			end)
+		end)
+	end
+	if data.sysBgColorR and not data.rgbSysBgEnabled then
+		task.delay(0.5, function()
+			systemMessageColor = Color3.new(data.sysBgColorR, data.sysBgColorG, data.sysBgColorB)
+			if sysBgColorButton and sysBgColorButton.Parent then
+				sysBgColorButton.BackgroundColor3 = systemMessageColor
+			end
+			updateSystemMessageColors()
+		end)
+	end
+	if data.rgbSysBgEnabled then
+		task.delay(0.5, function()
+			rgbSystemBgEnabled = true
+			if sysBgRGBButton then sysBgRGBButton.Text = "✨ RGB"; sysBgRGBButton.TextColor3 = Color3.fromRGB(100, 255, 200) end
+			if rgbSystemBgConnection then rgbSystemBgConnection:Disconnect(); rgbSystemBgConnection = nil end
+			local hue = 0
+			rgbSystemBgConnection = RunService.RenderStepped:Connect(function(dt)
+				hue = (hue + dt * 0.3) % 1
+				systemMessageColor = Color3.fromHSV(hue, 0.6, 0.4)
+				if sysBgColorButton and sysBgColorButton.Parent then
+					sysBgColorButton.BackgroundColor3 = systemMessageColor
+				end
+				updateSystemMessageColors()
+			end)
+		end)
+	end
+	if data.sysTextColorR and not data.rgbSysTextEnabled then
+		task.delay(0.5, function()
+			systemTextColor = Color3.new(data.sysTextColorR, data.sysTextColorG, data.sysTextColorB)
+			if sysTextColorButton and sysTextColorButton.Parent then
+				sysTextColorButton.BackgroundColor3 = systemTextColor
+				sysTextColorButton.TextColor3 = Color3.fromRGB(0, 0, 0)
+			end
+			updateSystemMessageColors()
+		end)
+	end
+	if data.rgbSysTextEnabled then
+		task.delay(0.5, function()
+			rgbSystemTextEnabled = true
+			if sysTextRGBButton then sysTextRGBButton.Text = "✨ RGB"; sysTextRGBButton.TextColor3 = Color3.fromRGB(100, 255, 200) end
+			if rgbSystemTextConnection then rgbSystemTextConnection:Disconnect(); rgbSystemTextConnection = nil end
+			local hue = 0
+			rgbSystemTextConnection = RunService.RenderStepped:Connect(function(dt)
+				hue = (hue + dt * 0.3) % 1
+				systemTextColor = Color3.fromHSV(hue, 0.7, 1)
+				if sysTextColorButton and sysTextColorButton.Parent then
+					sysTextColorButton.BackgroundColor3 = systemTextColor
+				end
+				updateSystemMessageColors()
+			end)
+		end)
+	end
+end
+task.delay(3, loadSettings)
+
+transparencySlider.MouseButton1Click:Connect(function()
+	CHAT_BG_TRANSPARENCY = math.clamp(CHAT_BG_TRANSPARENCY + 0.05, 0, 0.9)
+	chatFrame.BackgroundTransparency = CHAT_BG_TRANSPARENCY
+	transparencySlider.Text = "Chat Transparency: " .. string.format("%.2f", CHAT_BG_TRANSPARENCY)
+	saveSettings()
+end)
+
+--------------------------------------------------------------------
+-- RGB BORDER TOGGLE
+--------------------------------------------------------------------
+rgbButton = Instance.new("TextButton")
+rgbButton.Name = "RGBToggle"
+rgbButton.Text = "Enable RGB Border"
+rgbButton.Size = UDim2.new(1, -20, 0, 28)
+rgbButton.Position = UDim2.new(0, 10, 0, 100)
+rgbButton.BackgroundColor3 = Color3.fromRGB(45, 47, 53)
+rgbButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+rgbButton.Font = Enum.Font.Gotham
+rgbButton.TextSize = 14
+rgbButton.AutoButtonColor = false
+rgbButton.ZIndex = 22
+rgbButton.Parent = settingsPanel
+
+do
+	local rgbCorner = Instance.new("UICorner")
+	rgbCorner.CornerRadius = UDim.new(0, 10)
+	rgbCorner.Parent = rgbButton
+	local rgbStroke = Instance.new("UIStroke")
+	rgbStroke.Thickness = 1
+	rgbStroke.Transparency = 0.3
+	rgbStroke.Color = Color3.fromRGB(255, 255, 255)
+	rgbStroke.Parent = rgbButton
+end
+
+_G.RGB_BUBBLES_ENABLED = false
+
+rgbButton.MouseButton1Click:Connect(function()
+	rgbEnabled = not rgbEnabled
+	_G.RGB_BUBBLES_ENABLED = rgbEnabled
+	if rgbEnabled then
+		rgbButton.Text = "Disable RGB Border"
+		local hue = 0
+		rgbConnection = RunService.RenderStepped:Connect(function(dt)
+			hue = (hue + dt * 0.4) % 1
+			local color = Color3.fromHSV(hue, 1, 1)
+			if chatStroke then
+				chatStroke.Color = color
+				chatStroke.Transparency = 0.3
+				chatStroke.Thickness = _G.RGB_OUTLINE_THICKNESS
+			end
+		end)
+	else
+		rgbButton.Text = "Enable RGB Border"
+		if rgbConnection then rgbConnection:Disconnect(); rgbConnection = nil end
+		_G.RGB_BUBBLES_ENABLED = false
+		chatStroke.Color = Color3.fromRGB(255, 255, 255)
+	end
+	saveSettings()
+end)
+
+--------------------------------------------------------------------
+-- THICKNESS CONTROL
+--------------------------------------------------------------------
+do
+	local thicknessButton = Instance.new("TextButton")
+	_G.THICKNESS_BUTTON = thicknessButton
+	thicknessButton.Name = "RGBThicknessControl"
+	thicknessButton.Text = "Outline Thickness: " .. tostring(_G.RGB_OUTLINE_THICKNESS)
+	thicknessButton.Size = UDim2.new(1, -20, 0, 28)
+	thicknessButton.Position = UDim2.new(0, 10, 0, 130)
+	thicknessButton.BackgroundColor3 = Color3.fromRGB(55, 57, 63)
+	thicknessButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	thicknessButton.Font = Enum.Font.Gotham
+	thicknessButton.TextSize = 14
+	thicknessButton.AutoButtonColor = false
+	thicknessButton.ZIndex = 22
+	thicknessButton.Parent = settingsPanel
+
+	local thicknessCorner = Instance.new("UICorner")
+	thicknessCorner.CornerRadius = UDim.new(0, 10)
+	thicknessCorner.Parent = thicknessButton
+	local thicknessStroke = Instance.new("UIStroke")
+	thicknessStroke.Thickness = 1; thicknessStroke.Transparency = 0.3
+	thicknessStroke.Color = Color3.fromRGB(255, 255, 255)
+	thicknessStroke.Parent = thicknessButton
+
+	local thicknessBaseColor = thicknessButton.BackgroundColor3
+	thicknessButton.MouseEnter:Connect(function()
+		createSmoothTween(thicknessButton, {BackgroundColor3 = Color3.fromRGB(65, 67, 73)}, 0.15)
+	end)
+	thicknessButton.MouseLeave:Connect(function()
+		createSmoothTween(thicknessButton, {BackgroundColor3 = thicknessBaseColor}, 0.15)
+	end)
+	thicknessButton.MouseButton1Click:Connect(function()
+		if _G.RGB_OUTLINE_THICKNESS >= 5 then
+			_G.RGB_OUTLINE_THICKNESS = 1.5
+		else
+			_G.RGB_OUTLINE_THICKNESS = _G.RGB_OUTLINE_THICKNESS + 0.5
+		end
+		if chatStroke then chatStroke.Thickness = _G.RGB_OUTLINE_THICKNESS end
+		forceTextRefresh(thicknessButton, "Outline Thickness: " .. tostring(_G.RGB_OUTLINE_THICKNESS))
+		saveSettings()
+	end)
+end
+
+--------------------------------------------------------------------
+-- RESET BUTTON LOGIC
+--------------------------------------------------------------------
+resetButton.MouseButton1Click:Connect(function()
+	CHAT_BG_TRANSPARENCY = 0.15
+	chatFrame.BackgroundTransparency = 0.15
+	transparencySlider.Text = "Chat Transparency: 0.15"
+	_G.MAX_CHAT_BUBBLE_WIDTH = 400
+
+	if rgbConnection then rgbConnection:Disconnect(); rgbConnection = nil end
+	rgbEnabled = false
+	_G.RGB_BUBBLES_ENABLED = false
+	if rgbButton then rgbButton.Text = "Enable RGB Border" end
+	if chatStroke then
+		chatStroke.Color = Color3.fromRGB(255, 255, 255)
+		chatStroke.Transparency = 0.3
+		chatStroke.Thickness = DEFAULT_OUTLINE_THICKNESS
+	end
+
+	if rgbBackgroundConnection then rgbBackgroundConnection:Disconnect(); rgbBackgroundConnection = nil end
+	rgbBackgroundEnabled = false
+	if bgRGBButton then bgRGBButton.Text = "🎨 RGB"; bgRGBButton.TextColor3 = Color3.fromRGB(200, 200, 200) end
+	if chatFrame then chatFrame.BackgroundColor3 = chatBackgroundColor end
+	if bgColorButton and bgColorButton.Parent then bgColorButton.BackgroundColor3 = chatBackgroundColor end
+
+	_G.RGB_OUTLINE_THICKNESS = DEFAULT_OUTLINE_THICKNESS
+	if _G.THICKNESS_BUTTON then _G.THICKNESS_BUTTON.Text = "Outline Thickness: " .. tostring(DEFAULT_OUTLINE_THICKNESS) end
+	if _G.REAL_CHAT_STROKE then
+		_G.REAL_CHAT_STROKE.Thickness = DEFAULT_OUTLINE_THICKNESS
+		_G.REAL_CHAT_STROKE.Color = Color3.fromRGB(255, 255, 255)
+		_G.REAL_CHAT_STROKE.Transparency = 0.3
+	end
+
+	chatBackgroundColor = Color3.fromRGB(45, 47, 53)
+	chatFrame.BackgroundColor3 = chatBackgroundColor
+	bgColorButton.BackgroundColor3 = chatBackgroundColor
+
+	if rgbSystemBgEnabled then
+		rgbSystemBgEnabled = false
+		sysBgRGBButton.Text = "🎨 RGB"; sysBgRGBButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+		if rgbSystemBgConnection then rgbSystemBgConnection:Disconnect(); rgbSystemBgConnection = nil end
+	end
+	systemMessageColor = Color3.fromRGB(50, 62, 90)
+	if messagesFrame then
+		for _, bubble in ipairs(messagesFrame:GetChildren()) do
+			if bubble:IsA("Frame") and bubble:GetAttribute("IsSystemMessage") then
+				bubble.BackgroundColor3 = systemMessageColor
+			end
+		end
+	end
+	sysBgColorButton.BackgroundColor3 = systemMessageColor
+
+	if rgbSystemTextEnabled then
+		rgbSystemTextEnabled = false
+		sysTextRGBButton.Text = "🎨 RGB"; sysTextRGBButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+		if rgbSystemTextConnection then rgbSystemTextConnection:Disconnect(); rgbSystemTextConnection = nil end
+	end
+	systemTextColor = Color3.fromRGB(190, 210, 255)
+	sysTextColorButton.BackgroundColor3 = systemTextColor
+	sysTextColorButton.TextColor3 = Color3.fromRGB(0, 0, 0)
+	updateSystemMessageColors()
+	saveSettings()
+	-- addSystem called after it's defined below
+	task.defer(function()
+		if addSystem then addSystem("Chat settings fully reset to default.") end
+	end)
+end)
+
+--------------------------------------------------------------------
+-- TITLE BAR
+--------------------------------------------------------------------
+local titleBar = Instance.new("Frame")
+titleBar.Name = "TitleBar"
+titleBar.BackgroundColor3 = Color3.fromRGB(40, 42, 48)
+titleBar.BackgroundTransparency = TITLE_BG_TRANSPARENCY
+titleBar.BorderSizePixel = 0
+titleBar.Size = UDim2.new(1, 0, 0, 26)
+titleBar.ClipsDescendants = true
+titleBar.ZIndex = 11
+titleBar.Parent = chatFrame
+
+do
+	local titleCorner = Instance.new("UICorner")
+	titleCorner.CornerRadius = UDim.new(0, 14)
+	titleCorner.Parent = titleBar
+end
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Name = "TitleLabel"
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "Chat"
+titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 15
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Position = UDim2.new(0, 10, 0, 0)
+titleLabel.Size = UDim2.new(1, -130, 1, 0)
+titleLabel.ZIndex = 12
+titleLabel.Parent = titleBar
+
+local chatModeButton = Instance.new("TextLabel")
+chatModeButton.Name = "ChatModeButton"
+chatModeButton.BackgroundTransparency = 1
+chatModeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+chatModeButton.Font = Enum.Font.GothamBold
+chatModeButton.TextSize = 15
+chatModeButton.Text = "All Chat"
+chatModeButton.Size = UDim2.new(0, 0, 1, 0)
+chatModeButton.Position = UDim2.new(1, -96, 0, 0)
+chatModeButton.AnchorPoint = Vector2.new(1, 0)
+chatModeButton.TextXAlignment = Enum.TextXAlignment.Right
+chatModeButton.ZIndex = 12
+chatModeButton.Parent = titleBar
+
+local chatModeButtonClick = Instance.new("TextButton")
+chatModeButtonClick.Name = "ChatModeButtonClick"
+chatModeButtonClick.BackgroundTransparency = 1
+chatModeButtonClick.Text = ""
+chatModeButtonClick.Size = UDim2.new(0, 80, 1, 0)
+chatModeButtonClick.Position = UDim2.new(1, -132, 0, 0)
+chatModeButtonClick.AnchorPoint = Vector2.new(1, 0)
+chatModeButtonClick.ZIndex = 13
+chatModeButtonClick.Active = true
+chatModeButtonClick.Parent = titleBar
+
+local closeButton = Instance.new("TextButton")
+closeButton.Name = "CloseButton"
+closeButton.BackgroundTransparency = 1
+closeButton.Font = Enum.Font.GothamBold
+closeButton.TextSize = 18
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.Text = "×"
+closeButton.AnchorPoint = Vector2.new(1, 0)
+closeButton.Position = UDim2.new(1, -8, 0, 0)
+closeButton.Size = UDim2.new(0, 24, 1, 0)
+closeButton.AutoButtonColor = false
+closeButton.ZIndex = 15
+closeButton.Active = true
+closeButton.Parent = titleBar
+
+local settingsButton = Instance.new("TextButton")
+settingsButton.Name = "SettingsButton"
+settingsButton.BackgroundTransparency = 1
+settingsButton.Font = Enum.Font.GothamBold
+settingsButton.TextSize = 16
+settingsButton.TextColor3 = Color3.fromRGB(220, 220, 255)
+settingsButton.Text = "⚙️"
+settingsButton.AnchorPoint = Vector2.new(1, 0)
+settingsButton.Position = UDim2.new(1, -34, 0, 0)
+settingsButton.Size = UDim2.new(0, 26, 1, 0)
+settingsButton.AutoButtonColor = false
+settingsButton.ZIndex = 15
+settingsButton.Parent = titleBar
+
+do
+	local settingsBaseColor = settingsButton.TextColor3
+	settingsButton.MouseEnter:Connect(function()
+		createSmoothTween(settingsButton, {TextColor3 = Color3.fromRGB(160, 190, 255), TextSize = 18, Rotation = 20}, 0.18)
+	end)
+	settingsButton.MouseLeave:Connect(function()
+		createSmoothTween(settingsButton, {TextColor3 = settingsBaseColor, TextSize = 16, Rotation = 0}, 0.18)
+	end)
+	settingsButton.MouseButton1Down:Connect(function()
+		createSmoothTween(settingsButton, {TextSize = 14}, 0.08)
+	end)
+	settingsButton.MouseButton1Up:Connect(function()
+		createSmoothTween(settingsButton, {TextSize = 18}, 0.08)
+	end)
+	settingsButton.MouseButton1Click:Connect(function()
+		createSmoothTween(settingsButton, {TextSize = 14, Rotation = -10}, 0.06, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, function()
+			createSmoothTween(settingsButton, {TextSize = 18, Rotation = 0}, 0.08)
+		end)
+		toggleSettingsPanel()
+	end)
+end
+
+--------------------------------------------------------------------
+-- OWNER CROWN BUTTON
+--------------------------------------------------------------------
+local ownerButton = Instance.new("TextButton")
+ownerButton.Name = "OwnerCrownButton"
+ownerButton.BackgroundTransparency = 1
+ownerButton.Font = Enum.Font.GothamBold
+ownerButton.TextSize = 17
+ownerButton.TextColor3 = Color3.fromRGB(255, 215, 90)
+ownerButton.Text = "👑"
+ownerButton.AnchorPoint = Vector2.new(1, 0)
+ownerButton.Position = UDim2.new(1, -96, 0, 0)
+ownerButton.Size = UDim2.new(0, 26, 1, 0)
+ownerButton.AutoButtonColor = false
+ownerButton.ZIndex = 15
+ownerButton.Visible = localPlayer.UserId == OWNER_USER_ID
+ownerButton.Parent = titleBar
+
+do
+	local baseColor = ownerButton.TextColor3
+
+	ownerButton.MouseEnter:Connect(function()
+		createSmoothTween(ownerButton, {
+			TextColor3 = Color3.fromRGB(255, 240, 150),
+			TextSize = 20,
+			Rotation = -8
+		}, 0.18)
+	end)
+
+	ownerButton.MouseLeave:Connect(function()
+		createSmoothTween(ownerButton, {
+			TextColor3 = baseColor,
+			TextSize = 17,
+			Rotation = 0
+		}, 0.18)
+	end)
+end
+
+--------------------------------------------------------------------
+-- OWNER ROLE PANEL
+--------------------------------------------------------------------
+local ownerPanelOpen = false
+
+local ownerPanel = Instance.new("Frame")
+ownerPanel.Name = "OwnerRolePanel"
+ownerPanel.BackgroundColor3 = Color3.fromRGB(35, 37, 43)
+ownerPanel.BackgroundTransparency = 0.1
+ownerPanel.BorderSizePixel = 0
+ownerPanel.Size = UDim2.new(0, 300, 0, 500)
+ownerPanel.Position = UDim2.new(1, 30, 0, 80)
+ownerPanel.Visible = false
+ownerPanel.ZIndex = 80
+ownerPanel.Parent = screenGui
+
+do
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 16)
+	c.Parent = ownerPanel
+
+	local s = Instance.new("UIStroke")
+	s.Thickness = 1.5
+	s.Transparency = 0.2
+	s.Color = Color3.fromRGB(255, 215, 90)
+	s.Parent = ownerPanel
+end
+
+local ownerTitle = Instance.new("TextLabel")
+ownerTitle.BackgroundTransparency = 1
+ownerTitle.Text = "👑 Owner Tags"
+ownerTitle.Font = Enum.Font.GothamBold
+ownerTitle.TextSize = 16
+ownerTitle.TextColor3 = Color3.fromRGB(255, 230, 120)
+ownerTitle.TextXAlignment = Enum.TextXAlignment.Left
+ownerTitle.Size = UDim2.new(1, -20, 0, 28)
+ownerTitle.Position = UDim2.new(0, 10, 0, 8)
+ownerTitle.ZIndex = 81
+ownerTitle.Parent = ownerPanel
+
+local function makeOwnerBox(name, placeholder, x, y, w)
+	local box = Instance.new("TextBox")
+	box.Name = name
+	box.PlaceholderText = placeholder
+	box.Text = ""
+	box.ClearTextOnFocus = false
+	box.BackgroundColor3 = Color3.fromRGB(50, 52, 60)
+	box.TextColor3 = Color3.fromRGB(255, 255, 255)
+	box.PlaceholderColor3 = Color3.fromRGB(160, 160, 170)
+	box.Font = Enum.Font.Gotham
+	box.TextSize = 12
+	box.Size = UDim2.new(0, w, 0, 28)
+	box.Position = UDim2.new(0, x, 0, y)
+	box.ZIndex = 81
+	box.Parent = ownerPanel
+
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 8)
+	c.Parent = box
+
+	return box
+end
+
+local function makeOwnerButton(name, text, x, y, w, color)
+	local btn = Instance.new("TextButton")
+	btn.Name = name
+	btn.Text = text
+	btn.BackgroundColor3 = color or Color3.fromRGB(70, 80, 110)
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 12
+	btn.Size = UDim2.new(0, w, 0, 28)
+	btn.Position = UDim2.new(0, x, 0, y)
+	btn.AutoButtonColor = false
+	btn.ZIndex = 81
+	btn.Parent = ownerPanel
+
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 8)
+	c.Parent = btn
+
+	return btn
+end
+
+local OWNER_TAG_COLOR_PRESETS = {
+	{name = "Gold", color = Color3.fromRGB(255, 210, 60), text = "G"},
+	{name = "Red", color = Color3.fromRGB(255, 80, 80), text = "R"},
+	{name = "Blue", color = Color3.fromRGB(100, 170, 255), text = "B"},
+	{name = "Green", color = Color3.fromRGB(100, 230, 140), text = "Gr"},
+	{name = "Purple", color = Color3.fromRGB(190, 120, 255), text = "P"},
+	{name = "Pink", color = Color3.fromRGB(255, 120, 210), text = "Pk"},
+}
+
+local function setRGBBoxesFromColor(rBox, gBox, bBox, color)
+	rBox.Text = tostring(math.floor(color.R * 255))
+	gBox.Text = tostring(math.floor(color.G * 255))
+	bBox.Text = tostring(math.floor(color.B * 255))
+end
+
+local function makeOwnerColorPresetRow(y, rBox, gBox, bBox)
+	local startX = 10
+	local buttonSize = 36
+	local gap = 8
+
+	for i, preset in ipairs(OWNER_TAG_COLOR_PRESETS) do
+		local btn = Instance.new("TextButton")
+		btn.Name = "Preset_" .. preset.name
+		btn.Text = preset.text
+		btn.BackgroundColor3 = preset.color
+		btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 11
+		btn.Size = UDim2.new(0, buttonSize, 0, 24)
+		btn.Position = UDim2.new(0, startX + ((i - 1) * (buttonSize + gap)), 0, y)
+		btn.AutoButtonColor = false
+		btn.ZIndex = 82
+		btn.Parent = ownerPanel
+
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 8)
+		c.Parent = btn
+
+		local s = Instance.new("UIStroke")
+		s.Thickness = 1
+		s.Transparency = 0.35
+		s.Color = Color3.fromRGB(255, 255, 255)
+		s.Parent = btn
+
+		btn.MouseButton1Click:Connect(function()
+			setRGBBoxesFromColor(rBox, gBox, bBox, preset.color)
+		end)
+	end
+end
+
+function setTagRGBButtonState(button, enabled)
+	button:SetAttribute("RGBEnabled", enabled == true)
+
+	if enabled then
+		button.Text = "🌈 RGB TAG: ON"
+		button.BackgroundColor3 = Color3.fromRGB(90, 70, 130)
+		button.TextColor3 = Color3.fromRGB(255, 240, 255)
+	else
+		button.Text = "🌈 RGB TAG: OFF"
+		button.BackgroundColor3 = Color3.fromRGB(55, 57, 63)
+		button.TextColor3 = Color3.fromRGB(220, 220, 225)
+	end
+end
+
+function makeTagRGBToggleButton(name, x, y, w)
+	local button = makeOwnerButton(name, "🌈 RGB TAG: OFF", x, y, w, Color3.fromRGB(55, 57, 63))
+	setTagRGBButtonState(button, false)
+
+	button.MouseButton1Click:Connect(function()
+		setTagRGBButtonState(button, not button:GetAttribute("RGBEnabled"))
+	end)
+
+	return button
+end
+
+local selfTagBox = makeOwnerBox("SelfTagBox", "Your tag, ex: OWNER", 10, 45, 135)
+local selfRBox = makeOwnerBox("SelfR", "R", 155, 45, 35)
+local selfGBox = makeOwnerBox("SelfG", "G", 195, 45, 35)
+local selfBBox = makeOwnerBox("SelfB", "B", 235, 45, 35)
+
+local applySelfButton = makeOwnerButton("ApplySelfTag", "Apply My Tag", 10, 80, 125, Color3.fromRGB(120, 90, 40))
+local removeSelfButton = makeOwnerButton("RemoveSelfTag", "Remove My Tag", 145, 80, 125, Color3.fromRGB(120, 50, 50))
+
+selfRGBTagButton = makeTagRGBToggleButton("SelfRGBTagToggle", 10, 115, 260)
+
+makeOwnerColorPresetRow(150, selfRBox, selfGBox, selfBBox)
+
+local targetBox = makeOwnerBox("TargetBox", "Username or UserId", 10, 190, 260)
+local targetTagBox = makeOwnerBox("TargetTagBox", "Target tag, ex: ADMIN", 10, 225, 135)
+local targetRBox = makeOwnerBox("TargetR", "R", 155, 225, 35)
+local targetGBox = makeOwnerBox("TargetG", "G", 195, 225, 35)
+local targetBBox = makeOwnerBox("TargetB", "B", 235, 225, 35)
+
+local applyTargetButton = makeOwnerButton("ApplyTargetTag", "Apply Player Tag", 10, 260, 125, Color3.fromRGB(60, 90, 130))
+local removeTargetButton = makeOwnerButton("RemoveTargetTag", "Remove Tag", 145, 260, 125, Color3.fromRGB(120, 50, 50))
+
+targetRGBTagButton = makeTagRGBToggleButton("TargetRGBTagToggle", 10, 295, 260)
+
+makeOwnerColorPresetRow(330, targetRBox, targetGBox, targetBBox)
+
+local ownerMessageBox = makeOwnerBox("OwnerMessageBox", "Owner message to send", 10, 370, 180)
+local sendOwnerMsgButton = makeOwnerButton("SendOwnerMessage", "Send", 200, 370, 70, Color3.fromRGB(80, 120, 70))
+
+local roleList = Instance.new("ScrollingFrame")
+roleList.Name = "OwnerRoleList"
+roleList.BackgroundColor3 = Color3.fromRGB(28, 30, 36)
+roleList.BackgroundTransparency = 0.2
+roleList.BorderSizePixel = 0
+roleList.Position = UDim2.new(0, 10, 0, 415)
+roleList.Size = UDim2.new(1, -20, 0, 72)
+roleList.ScrollBarThickness = 4
+roleList.CanvasSize = UDim2.new(0, 0, 0, 0)
+roleList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+roleList.ZIndex = 81
+roleList.Parent = ownerPanel
+
+do
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 8)
+	c.Parent = roleList
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = roleList
+end
+
+local function numberFromBox(box, fallback)
+	return math.clamp(tonumber(box.Text) or fallback, 0, 255)
+end
+
+local function colorFromBoxes(rBox, gBox, bBox)
+	return {
+		r = numberFromBox(rBox, 255),
+		g = numberFromBox(gBox, 255),
+		b = numberFromBox(bBox, 255)
+	}
+end
+
+toggleOwnerPanel = function()
+	if localPlayer.UserId ~= OWNER_USER_ID then return end
+
+	ownerPanelOpen = not ownerPanelOpen
+
+	if ownerPanelOpen then
+		closeAllSidePanels("owner")
+		ownerPanel.Visible = true
+		ownerPanel.Position = UDim2.new(1, 30, 0, 80)
+		createSmoothTween(ownerPanel, {
+			Position = UDim2.new(1, -310, 0, 80),
+			BackgroundTransparency = 0.1
+		}, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+		if OwnerTagEvent then
+			OwnerTagEvent:FireServer("request", {})
+		end
+	else
+		createSmoothTween(ownerPanel, {
+			Position = UDim2.new(1, 30, 0, 80),
+			BackgroundTransparency = 0.25
+		}, 0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function()
+			ownerPanel.Visible = false
+		end)
+	end
+end
+
+ownerButton.MouseButton1Click:Connect(toggleOwnerPanel)
+
+applySelfButton.MouseButton1Click:Connect(function()
+	if not OwnerTagEvent then return end
+
+	local color = colorFromBoxes(selfRBox, selfGBox, selfBBox)
+	color.rgb = selfRGBTagButton:GetAttribute("RGBEnabled") == true
+
+	OwnerTagEvent:FireServer("setTag", {
+		target = localPlayer.UserId,
+		tag = selfTagBox.Text,
+		color = color
+	})
+end)
+
+removeSelfButton.MouseButton1Click:Connect(function()
+	if not OwnerTagEvent then return end
+
+	OwnerTagEvent:FireServer("removeTag", {
+		target = localPlayer.UserId,
+		suppressDefault = true
+	})
+
+	selfTagBox.Text = ""
+end)
+
+applyTargetButton.MouseButton1Click:Connect(function()
+	if not OwnerTagEvent then return end
+
+	local color = colorFromBoxes(targetRBox, targetGBox, targetBBox)
+	color.rgb = targetRGBTagButton:GetAttribute("RGBEnabled") == true
+
+	OwnerTagEvent:FireServer("setTag", {
+		target = targetBox.Text,
+		tag = targetTagBox.Text,
+		color = color
+	})
+end)
+
+removeTargetButton.MouseButton1Click:Connect(function()
+	if not OwnerTagEvent then return end
+
+	OwnerTagEvent:FireServer("removeTag", {
+		target = targetBox.Text
+	})
+end)
+
+sendOwnerMsgButton.MouseButton1Click:Connect(function()
+	if not OwnerTagEvent then return end
+
+	OwnerTagEvent:FireServer("ownerMessage", {
+		message = ownerMessageBox.Text
+	})
+
+	ownerMessageBox.Text = ""
+end)
+
+--------------------------------------------------------------------
+-- MESSAGES FRAME
+--------------------------------------------------------------------
+messagesFrame = Instance.new("ScrollingFrame")
+messagesFrame.Name = "Messages"
+messagesFrame.BackgroundTransparency = 1
+messagesFrame.BorderSizePixel = 0
+messagesFrame.Position = UDim2.new(0, 8, 0, 32)
+messagesFrame.Size = UDim2.new(1, -16, 1, -80)
+messagesFrame.ScrollBarThickness = 4
+messagesFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+messagesFrame.ZIndex = 11
+messagesFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+messagesFrame.ScrollBarImageTransparency = 0.5
+messagesFrame.ElasticBehavior = Enum.ElasticBehavior.Always
+messagesFrame.ScrollingEnabled = true
+messagesFrame.ScrollBarImageColor3 = Color3.fromRGB(255, 255, 255)
+messagesFrame.BottomImage = "rbxasset://textures/ui/Scroll/scroll-bottom.png"
+messagesFrame.TopImage = "rbxasset://textures/ui/Scroll/scroll-top.png"
+messagesFrame.MidImage = "rbxasset://textures/ui/Scroll/scroll-middle.png"
+messagesFrame.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
+messagesFrame.Active = true
+messagesFrame.SelectionGroup = true
+messagesFrame.Draggable = false
+messagesFrame.Parent = chatFrame
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Padding = UDim.new(0, 4)
+listLayout.Parent = messagesFrame
+
+local function resizeCanvas()
+	task.wait()
+	local contentHeight = listLayout.AbsoluteContentSize.Y
+	messagesFrame.CanvasSize = UDim2.new(0, 0, 0, contentHeight + 8)
+	if contentHeight > messagesFrame.AbsoluteSize.Y then
+		messagesFrame.CanvasPosition = Vector2.new(0, contentHeight - messagesFrame.AbsoluteSize.Y + 8)
+	end
+end
+
+listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(resizeCanvas)
+
+messagesFrame.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch then
+		messagesFrame.ScrollingEnabled = true
+	end
+end)
+
+--------------------------------------------------------------------
+-- INPUT BAR
+--------------------------------------------------------------------
+local inputFrame = Instance.new("Frame")
+inputFrame.Name = "InputFrame"
+inputFrame.BackgroundColor3 = Color3.fromRGB(45, 47, 53)
+inputFrame.BackgroundTransparency = INPUT_BG_TRANSPARENCY
+inputFrame.BorderSizePixel = 0
+inputFrame.AnchorPoint = Vector2.new(0.5, 1)
+inputFrame.Position = UDim2.new(0.5, 0, 1, -6)
+inputFrame.Size = UDim2.new(1, -16, 0, 30)
+inputFrame.ZIndex = 11
+inputFrame.Parent = chatFrame
+
+do
+	local inputCorner = Instance.new("UICorner")
+	inputCorner.CornerRadius = UDim.new(0, 10)
+	inputCorner.Parent = inputFrame
+	local inputStroke = Instance.new("UIStroke")
+	inputStroke.Thickness = 1; inputStroke.Transparency = 0.3
+	inputStroke.Color = Color3.fromRGB(255, 255, 255)
+	inputStroke.Parent = inputFrame
+end
+
+local inputBox = Instance.new("TextBox")
+inputBox.Name = "InputBox"
+inputBox.BackgroundTransparency = 1
+inputBox.Text = ""
+inputBox.PlaceholderText = "Type a message... (/e dance for emotes)"
+inputBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+inputBox.PlaceholderColor3 = Color3.fromRGB(180, 180, 190)
+inputBox.Font = Enum.Font.Gotham
+inputBox.TextSize = 15
+inputBox.TextXAlignment = Enum.TextXAlignment.Left
+inputBox.ClearTextOnFocus = false
+inputBox.Size = UDim2.new(1, -74, 1, -4)
+inputBox.Position = UDim2.new(0, 6, 0, 2)
+inputBox.Active = true
+inputBox.TextEditable = true
+inputBox.ZIndex = 12
+inputBox.Parent = inputFrame
+
+print("SafetyChatClient: UI elements created")
+
+--------------------------------------------------------------------
+-- EMOJI PICKER
+--------------------------------------------------------------------
+local emojiButton = Instance.new("TextButton")
+emojiButton.Name = "EmojiButton"
+emojiButton.BackgroundTransparency = 1
+emojiButton.Text = "😀"
+emojiButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+emojiButton.Font = Enum.Font.GothamBold
+emojiButton.TextSize = 16
+emojiButton.Size = UDim2.new(0, 26, 0, 26)
+emojiButton.Position = UDim2.new(1, -6, 0.5, 0)
+emojiButton.AnchorPoint = Vector2.new(1, 0.5)
+emojiButton.AutoButtonColor = false
+emojiButton.ZIndex = 13
+emojiButton.Parent = inputFrame
+
+do
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,8); c.Parent = emojiButton
+	local s = Instance.new("UIStroke"); s.Thickness = 1; s.Transparency = 0.3
+	s.Color = Color3.fromRGB(255,255,255); s.Parent = emojiButton
+end
+
+local emojiPickerFrame = Instance.new("Frame")
+emojiPickerFrame.Name = "EmojiPicker"
+emojiPickerFrame.BackgroundColor3 = Color3.fromRGB(35, 37, 43)
+emojiPickerFrame.BackgroundTransparency = 0.1
+emojiPickerFrame.BorderSizePixel = 0
+emojiPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+emojiPickerFrame.Position = UDim2.new(0, 0, 0, 0)
+emojiPickerFrame.AnchorPoint = Vector2.new(0, 0)
+emojiPickerFrame.Visible = false
+emojiPickerFrame.ZIndex = 100
+emojiPickerFrame.Parent = screenGui
+
+do
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,12); c.Parent = emojiPickerFrame
+	local s = Instance.new("UIStroke"); s.Thickness = 1; s.Transparency = 0.2
+	s.Color = Color3.fromRGB(255,255,255); s.Parent = emojiPickerFrame
+	local eg = Instance.new("UIGridLayout")
+	eg.CellPadding = UDim2.new(0,6,0,6); eg.CellSize = UDim2.new(0,32,0,32)
+	eg.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	eg.VerticalAlignment = Enum.VerticalAlignment.Center
+	eg.SortOrder = Enum.SortOrder.LayoutOrder
+	eg.StartCorner = Enum.StartCorner.TopLeft
+	eg.Parent = emojiPickerFrame
+	local ep = Instance.new("UIPadding")
+	ep.PaddingTop = UDim.new(0,10); ep.PaddingBottom = UDim.new(0,10)
+	ep.PaddingLeft = UDim.new(0,10); ep.PaddingRight = UDim.new(0,10)
+	ep.Parent = emojiPickerFrame
+end
+
+local emojiButtons = {}
+local allowedEmojisArray = {"😂","💀","😭","🔥","🗿","😈","💯","🥶","😱","👍","✅","❌","❗","❓"}
+local isEmojiPickerOpen = false
+local toggleEmojiPicker -- forward
+
+do
+	for i, emoji in ipairs(allowedEmojisArray) do
+		local emojiBtn = Instance.new("TextButton")
+		emojiBtn.Name = "Emoji_" .. i
+		emojiBtn.BackgroundColor3 = Color3.fromRGB(50, 52, 58)
+		emojiBtn.BackgroundTransparency = 0.5
+		emojiBtn.Text = emoji
+		emojiBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		emojiBtn.Font = Enum.Font.SourceSans
+		emojiBtn.TextSize = 20
+		emojiBtn.AutoButtonColor = false
+		emojiBtn.Size = UDim2.new(0, 32, 0, 32)
+		emojiBtn.ZIndex = 101
+		emojiBtn.LayoutOrder = i
+		emojiBtn.Parent = emojiPickerFrame
+		local ec = Instance.new("UICorner"); ec.CornerRadius = UDim.new(0,8); ec.Parent = emojiBtn
+		local es = Instance.new("UIStroke"); es.Thickness = 1; es.Transparency = 0.5; es.Color = Color3.fromRGB(255,255,255); es.Parent = emojiBtn
+		table.insert(emojiButtons, emojiBtn)
+		emojiBtn.MouseEnter:Connect(function()
+			createSmoothTween(emojiBtn, {BackgroundTransparency=0.1, BackgroundColor3=Color3.fromRGB(70,72,78), TextSize=22}, 0.15)
+			createSmoothTween(es, {Transparency=0.1, Thickness=1.5}, 0.15)
+		end)
+		emojiBtn.MouseLeave:Connect(function()
+			createSmoothTween(emojiBtn, {BackgroundTransparency=0.5, BackgroundColor3=Color3.fromRGB(50,52,58), TextSize=20}, 0.15)
+			createSmoothTween(es, {Transparency=0.5, Thickness=1}, 0.15)
+		end)
+		emojiBtn.MouseButton1Click:Connect(function()
+			inputBox.Text = inputBox.Text .. emoji
+			toggleEmojiPicker(false)
+			inputBox:CaptureFocus()
+		end)
+	end
+end
+
+local emojiCols = 5
+local emojiRows = math.ceil(#allowedEmojisArray / emojiCols)
+local emojiPickerWidth = emojiCols * 38 + 20
+local emojiPickerHeight = emojiRows * 38 + 20
+
+local function updateEmojiPickerPosition()
+	if not emojiPickerFrame then return end
+	local inputFrameAbsPos = inputFrame.AbsolutePosition
+	local inputFrameAbsSize = inputFrame.AbsoluteSize
+	local screenSize = workspace.CurrentCamera.ViewportSize
+	local xPosition = inputFrameAbsPos.X + inputFrameAbsSize.X + 16
+	local yPosition = inputFrameAbsPos.Y + (inputFrameAbsSize.Y / 2) - (emojiPickerHeight / 2) + 12
+	if (xPosition + emojiPickerWidth + 8) > screenSize.X then
+		xPosition = inputFrameAbsPos.X - emojiPickerWidth - 8
+	end
+	yPosition = math.max(8, math.min(yPosition, screenSize.Y - emojiPickerHeight - 8))
+	emojiPickerFrame.Position = UDim2.new(0, xPosition, 0, yPosition)
+end
+
+workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateEmojiPickerPosition)
+inputFrame:GetPropertyChangedSignal("AbsolutePosition"):Connect(updateEmojiPickerPosition)
+task.wait(0.1)
+updateEmojiPickerPosition()
+
+toggleEmojiPicker = function(show)
+	if isEmojiPickerOpen == show then return end
+
+	-- FIX: If opening emojis, close sticker picker first
+	if show and toggleStickerPicker then
+		toggleStickerPicker(false)
+	end
+
+	isEmojiPickerOpen = show
+
+	if show then
+		updateEmojiPickerPosition()
+
+		emojiPickerFrame.Visible = true
+		emojiPickerFrame.BackgroundTransparency = 1
+		emojiPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+
+		createSmoothTween(
+			emojiPickerFrame,
+			{
+				BackgroundTransparency = 0.1,
+				Size = UDim2.new(0, emojiPickerWidth, 0, emojiPickerHeight)
+			},
+			0.25,
+			Enum.EasingStyle.Back,
+			Enum.EasingDirection.Out
+		)
+
+		for i, btn in ipairs(emojiButtons) do
+			btn.BackgroundTransparency = 1
+			btn.TextTransparency = 1
+			btn.Size = UDim2.new(0, 0, 0, 0)
+
+			task.delay(i * 0.03, function()
+				-- FIX: Ignore old delayed animations if picker was closed
+				if not isEmojiPickerOpen then return end
+				if not btn or not btn.Parent then return end
+
+				createSmoothTween(
+					btn,
+					{
+						BackgroundTransparency = 0.5,
+						TextTransparency = 0,
+						Size = UDim2.new(0, 32, 0, 32)
+					},
+					0.2,
+					Enum.EasingStyle.Back,
+					Enum.EasingDirection.Out
+				)
+			end)
+		end
+
+		createSmoothTween(
+			emojiButton,
+			{
+				TextColor3 = Color3.fromRGB(200, 220, 255),
+				TextSize = 18
+			},
+			0.2
+		)
+
+	else
+		createSmoothTween(
+			emojiPickerFrame,
+			{
+				BackgroundTransparency = 1,
+				Size = UDim2.new(0, 0, 0, 0)
+			},
+			0.2,
+			Enum.EasingStyle.Quad,
+			Enum.EasingDirection.In,
+			function()
+				if not isEmojiPickerOpen then
+					emojiPickerFrame.Visible = false
+				end
+			end
+		)
+
+		for i, btn in ipairs(emojiButtons) do
+			task.delay((#emojiButtons - i) * 0.01, function()
+				-- FIX: Don't run old closing animation after reopening
+				if isEmojiPickerOpen then return end
+				if not btn or not btn.Parent then return end
+
+				createSmoothTween(
+					btn,
+					{
+						BackgroundTransparency = 1,
+						TextTransparency = 1,
+						Size = UDim2.new(0, 0, 0, 0)
+					},
+					0.15
+				)
+			end)
+		end
+
+		createSmoothTween(
+			emojiButton,
+			{
+				TextColor3 = Color3.fromRGB(255, 255, 255),
+				TextSize = 16
+			},
+			0.2
+		)
+	end
+end
+
+emojiButton.MouseEnter:Connect(function()
+	if not isEmojiPickerOpen then
+		createSmoothTween(emojiButton, {TextSize=18, TextColor3=Color3.fromRGB(240,240,255)}, 0.15)
+	end
+end)
+emojiButton.MouseLeave:Connect(function()
+	if not isEmojiPickerOpen then
+		createSmoothTween(emojiButton, {TextSize=16, TextColor3=Color3.fromRGB(255,255,255)}, 0.15)
+	end
+end)
+emojiButton.MouseButton1Click:Connect(function()
+	toggleEmojiPicker(not isEmojiPickerOpen)
+end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if isEmojiPickerOpen and input.UserInputType == Enum.UserInputType.MouseButton1 then
+		local mousePos = UserInputService:GetMouseLocation()
+		local ep = emojiPickerFrame.AbsolutePosition; local es = emojiPickerFrame.AbsoluteSize
+		local bp = emojiButton.AbsolutePosition; local bs = emojiButton.AbsoluteSize
+		local inPicker = mousePos.X >= ep.X and mousePos.X <= ep.X+es.X and mousePos.Y >= ep.Y and mousePos.Y <= ep.Y+es.Y
+		local inButton = mousePos.X >= bp.X and mousePos.X <= bp.X+bs.X and mousePos.Y >= bp.Y and mousePos.Y <= bp.Y+bs.Y
+		if not inPicker and not inButton then toggleEmojiPicker(false) end
+	end
+	if input.KeyCode == Enum.KeyCode.Escape and isEmojiPickerOpen then toggleEmojiPicker(false) end
+end)
+
+print("SafetyChatClient: Emoji picker feature added")
+
+--------------------------------------------------------------------
+-- TOGGLE BUTTON HOVER
+--------------------------------------------------------------------
+local toggleBaseColor = chatToggleButton.BackgroundColor3
+chatToggleButton.MouseEnter:Connect(function()
+	createSmoothTween(chatToggleButton, {BackgroundColor3 = Color3.fromRGB(28, 29, 32)}, 0.18)
+end)
+chatToggleButton.MouseLeave:Connect(function()
+	createSmoothTween(chatToggleButton, {BackgroundColor3 = toggleBaseColor}, 0.18)
+end)
+
+local closeBaseColor = closeButton.TextColor3
+closeButton.MouseEnter:Connect(function()
+	createSmoothTween(closeButton, {TextColor3 = Color3.fromRGB(255,100,100), TextSize = 20}, 0.15)
+end)
+closeButton.MouseLeave:Connect(function()
+	createSmoothTween(closeButton, {TextColor3 = closeBaseColor, TextSize = 18}, 0.15)
+end)
+
+--------------------------------------------------------------------
+-- CHAT MODE BUTTON
+--------------------------------------------------------------------
+local hoverTween = nil
+local function updateChatModeButton(instant)
+	local player = Players.LocalPlayer
+	local hasTeam = player.Team ~= nil
+	if hoverTween then hoverTween:Cancel(); hoverTween = nil end
+
+	local newText, newColor
+	if currentChatMode == "team" then
+		if hasTeam then
+			newText = player.Team.Name .. " Chat"
+			newColor = player.Team.TeamColor and player.Team.TeamColor.Color or Color3.fromRGB(255,200,200)
+		else
+			newText = "Team Chat (No Team)"
+			newColor = Color3.fromRGB(180, 180, 180)
+		end
+	else
+		newText = "All Chat"
+		newColor = Color3.fromRGB(255, 255, 255)
+	end
+
+	chatModeButton.Visible = true
+	chatModeButtonClick.Visible = true
+
+	local textService = game:GetService("TextService")
+	local textSize = textService:GetTextSize(newText, chatModeButton.TextSize, chatModeButton.Font, Vector2.new(math.huge, math.huge))
+
+	chatModeButton.Text = newText
+	chatModeButton.TextColor3 = newColor
+	chatModeButton.Size = UDim2.new(0, textSize.X + 4, 1, 0)
+	chatModeButtonClick.Size = UDim2.new(0, math.max(textSize.X + 4, 80), 1, 0)
+end
+
+-- addSystem forward-declared
+local addSystem
+local addBubble
+
+local function richEscape(text)
+	text = tostring(text or "")
+	text = text:gsub("&", "&amp;")
+	text = text:gsub("<", "&lt;")
+	text = text:gsub(">", "&gt;")
+	return text
+end
+
+local function roleColorToHex(role)
+	local c = role and role.color or {}
+	local r = math.clamp(tonumber(c.r) or 255, 0, 255)
+	local g = math.clamp(tonumber(c.g) or 255, 0, 255)
+	local b = math.clamp(tonumber(c.b) or 255, 0, 255)
+
+	return string.format("#%02X%02X%02X", r, g, b)
+end
+
+-- Animated RGB tag helpers
+function rainbowTagHex()
+	local color = Color3.fromHSV((os.clock() * 0.35) % 1, 0.9, 1)
+
+	return string.format(
+		"#%02X%02X%02X",
+		math.floor(color.R * 255),
+		math.floor(color.G * 255),
+		math.floor(color.B * 255)
+	)
+end
+
+function makeRichRolePrefix(role, forcedHex)
+	if type(role) ~= "table" or not role.tag or role.tag == "" then
+		return ""
+	end
+
+	local hex
+
+	if role.rgb == true then
+		hex = forcedHex or rainbowTagHex()
+	else
+		hex = roleColorToHex(role)
+	end
+
+	return '<font color="' .. hex .. '">[' .. richEscape(role.tag) .. ']</font> '
+end
+
+task.spawn(function()
+	while task.wait(0.08) do
+		if messagesFrame then
+			local hex = rainbowTagHex()
+
+			for _, obj in ipairs(messagesFrame:GetDescendants()) do
+				if obj:IsA("TextButton") then
+					local tag = obj:GetAttribute("RainbowTagText")
+					local username = obj:GetAttribute("RainbowUsernameText")
+
+					if tag and tag ~= "" and username and username ~= "" then
+						obj.Text =
+							'<font color="' .. hex .. '">[' .. richEscape(tag) .. ']</font> '
+							.. richEscape(username)
+					end
+				end
+			end
+		end
+	end
+end)
+
+local function refreshOwnerRoleList()
+	if not roleList then return end
+
+	for _, child in ipairs(roleList:GetChildren()) do
+		if child:IsA("TextLabel") then
+			child:Destroy()
+		end
+	end
+
+	local count = 0
+
+	for userId, role in pairs(ownerRoleCache) do
+		if type(role) == "table" and role.tag then
+			count += 1
+
+			local label = Instance.new("TextLabel")
+			label.BackgroundTransparency = 1
+			label.RichText = true
+			label.Text = tostring(userId) .. " → " .. makeRichRolePrefix(role)
+			label.TextColor3 = Color3.fromRGB(230, 230, 235)
+			label.Font = Enum.Font.Gotham
+			label.TextSize = 12
+			label.TextXAlignment = Enum.TextXAlignment.Left
+			label.Size = UDim2.new(1, -8, 0, 20)
+			label.ZIndex = 82
+			label.Parent = roleList
+		end
+	end
+
+	if count == 0 then
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Text = "No custom tags yet."
+		label.TextColor3 = Color3.fromRGB(160, 160, 170)
+		label.Font = Enum.Font.Gotham
+		label.TextSize = 12
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.Size = UDim2.new(1, -8, 0, 20)
+		label.ZIndex = 82
+		label.Parent = roleList
+	end
+end
+
+if OwnerTagEvent then
+	OwnerTagEvent.OnClientEvent:Connect(function(action, a, b)
+		if action == "sync" and type(a) == "table" then
+			ownerRoleCache = a
+			refreshOwnerRoleList()
+			return
+		end
+
+		if action == "playerTag" then
+			local userId = tostring(a)
+
+			if b then
+				ownerRoleCache[userId] = b
+			else
+				ownerRoleCache[userId] = nil
+			end
+
+			refreshOwnerRoleList()
+			return
+		end
+	end)
+
+	if localPlayer.UserId == OWNER_USER_ID then
+		task.defer(function()
+			task.wait(1)
+			OwnerTagEvent:FireServer("request", {})
+		end)
+	end
+end
+
+chatModeButtonClick.MouseButton1Click:Connect(function()
+	if hoverTween then hoverTween:Cancel(); hoverTween = nil end
+	local player = Players.LocalPlayer
+	if currentChatMode == "all" then
+		if not player.Team then
+			addSystem("You need to be on a team to use team chat! Switching back to All Chat.")
+			currentChatMode = "all"
+		else
+			currentChatMode = "team"
+			addSystem("Switched to Team Chat - only your team can see your messages")
+		end
+	else
+		currentChatMode = "all"
+		addSystem("Switched to All Chat - everyone can see your messages")
+	end
+	updateChatModeButton(false)
+end)
+
+chatModeButtonClick.MouseEnter:Connect(function()
+	if hoverTween then hoverTween:Cancel() end
+	if currentChatMode == "team" then
+		local player = Players.LocalPlayer
+		if player.Team and player.Team.TeamColor then
+			local tc = player.Team.TeamColor.Color
+			local hc = Color3.new(math.min(tc.R*1.2,1), math.min(tc.G*1.2,1), math.min(tc.B*1.2,1))
+			hoverTween = createSmoothTween(chatModeButton, {TextColor3 = hc}, 0.15)
+		else
+			hoverTween = createSmoothTween(chatModeButton, {TextColor3 = Color3.fromRGB(200,200,200)}, 0.15)
+		end
+	else
+		hoverTween = createSmoothTween(chatModeButton, {TextColor3 = Color3.fromRGB(200,200,255)}, 0.15)
+	end
+end)
+chatModeButtonClick.MouseLeave:Connect(function()
+	if hoverTween then hoverTween:Cancel(); hoverTween = nil end
+	updateChatModeButton(false)
+end)
+
+local function checkTeamStatus()
+	local player = Players.LocalPlayer
+	if player then
+		player:GetPropertyChangedSignal("Team"):Connect(function()
+			if not player.Team and currentChatMode == "team" then
+				currentChatMode = "all"
+				addSystem("You left your team - switched to All Chat")
+			end
+			updateChatModeButton(false)
+			if player.Team then
+				player.Team:GetPropertyChangedSignal("Name"):Connect(function()
+					if currentChatMode == "team" then updateChatModeButton(false) end
+				end)
+			end
+		end)
+		if player.Team then
+			player.Team:GetPropertyChangedSignal("Name"):Connect(function()
+				if currentChatMode == "team" then updateChatModeButton(false) end
+			end)
+		end
+	end
+end
+checkTeamStatus()
+updateChatModeButton(true)
+
+--------------------------------------------------------------------
+-- addBubble / addSystem
+--------------------------------------------------------------------
+addBubble = function(text, textColor, userId, isSystem, roleInfo)
+	local bubble = Instance.new("Frame")
+	bubble:SetAttribute("IsSystemMessage", isSystem == true)
+	bubble.BackgroundColor3 = isSystem and systemMessageColor or Color3.fromRGB(45, 47, 53)
+	bubble.BackgroundTransparency = 1
+	bubble.BorderSizePixel = 0
+	bubble.Size = UDim2.new(1, 0, 0, 0)
+	bubble.AutomaticSize = Enum.AutomaticSize.Y
+	bubble.ZIndex = 12
+	bubble.Parent = messagesFrame
+
+	local hLayout = Instance.new("UIListLayout")
+	hLayout.FillDirection = Enum.FillDirection.Horizontal
+	hLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	hLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+	hLayout.Padding = UDim.new(0, 6)
+	hLayout.Parent = bubble
+
+	do
+		local bubbleCorner = Instance.new("UICorner")
+		bubbleCorner.CornerRadius = UDim.new(0, 12)
+		bubbleCorner.Parent = bubble
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 8); padding.PaddingRight = UDim.new(0, 8)
+		padding.PaddingTop = UDim.new(0, 4); padding.PaddingBottom = UDim.new(0, 4)
+		padding.Parent = bubble
+	end
+
+	local iconObj = nil
+	if userId and userId ~= 0 then
+		local thumb = getThumbnail(userId)
+		if thumb ~= "" then
+			local icon = Instance.new("ImageLabel")
+			icon.BackgroundTransparency = 1
+			icon.Image = thumb
+			icon.Size = UDim2.new(0, 18, 0, 18)
+			icon.LayoutOrder = 1
+			icon.ZIndex = 13
+			icon.Parent = bubble
+			icon.ImageTransparency = 1
+			local iconCorner = Instance.new("UICorner")
+			iconCorner.CornerRadius = UDim.new(1, 0)
+			iconCorner.Parent = icon
+			iconObj = icon
+		end
+	end
+
+	local usernameEnd = text:find(": ")
+	local usernameText = text
+	local messageText = ""
+	if usernameEnd then
+		usernameText = text:sub(1, usernameEnd + 1)
+		messageText = text:sub(usernameEnd + 2)
+	end
+
+	local usernameLabel = Instance.new("TextButton")
+	usernameLabel.RichText = true
+	usernameLabel.AutoButtonColor = false
+	usernameLabel.BackgroundTransparency = 1
+	usernameLabel.Font = Enum.Font.Gotham
+	usernameLabel.TextSize = 15
+	usernameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	usernameLabel.TextWrapped = false
+	local role = roleInfo
+
+	if not role and userId and userId ~= 0 then
+		role = ownerRoleCache[tostring(userId)]
+	end
+
+	if role and not isSystem then
+		usernameLabel.Text = makeRichRolePrefix(role) .. richEscape(usernameText)
+
+		if role.rgb == true then
+			usernameLabel:SetAttribute("RainbowTagText", tostring(role.tag))
+			usernameLabel:SetAttribute("RainbowUsernameText", tostring(usernameText))
+		else
+			usernameLabel:SetAttribute("RainbowTagText", "")
+			usernameLabel:SetAttribute("RainbowUsernameText", "")
+		end
+	else
+		usernameLabel.Text = richEscape(usernameText)
+		usernameLabel:SetAttribute("RainbowTagText", "")
+		usernameLabel:SetAttribute("RainbowUsernameText", "")
+	end
+	usernameLabel.TextColor3 = textColor
+	usernameLabel.AutomaticSize = Enum.AutomaticSize.XY
+	usernameLabel.Size = UDim2.new(0, 0, 0, 0)
+	usernameLabel.LayoutOrder = 2
+	usernameLabel.ZIndex = 13
+	usernameLabel.Parent = bubble
+	usernameLabel.TextTransparency = 1
+
+	usernameLabel.MouseButton1Click:Connect(function()
+		if not userId or userId == 0 then return end
+		local target = Players:GetPlayerByUserId(userId)
+		if not target then return end
+		if target == Players.LocalPlayer then addSystem("You can't whisper to yourself"); return end
+		if whisperTargetPlayer == target then
+			whisperTargetPlayer = nil
+			inputBox.PlaceholderText = "Type a message..."
+			addSystem("Whisper canceled")
+		else
+			whisperTargetPlayer = target
+			inputBox.PlaceholderText = "[Whisper to " .. target.Name .. "]"
+			addSystem("Whispering to " .. target.Name)
+		end
+	end)
+
+	usernameLabel.MouseButton2Click:Connect(function()
+		if not userId or userId == 0 then return end
+		local target = Players:GetPlayerByUserId(userId)
+		if not target or target == Players.LocalPlayer then return end
+		Players:ReportAbuse(target, "Inappropriate chat message", "")
+	end)
+	
+	if messageText == "" then
+		hLayout.FillDirection = Enum.FillDirection.Vertical
+		usernameLabel.TextWrapped = true
+		usernameLabel.AutomaticSize = Enum.AutomaticSize.Y
+		usernameLabel.Size = UDim2.new(1, 0, 0, 0)
+	end
+
+	local messageLabel = nil
+	if messageText ~= "" then
+		messageLabel = Instance.new("TextLabel")
+		messageLabel.BackgroundTransparency = 1
+		messageLabel.Font = Enum.Font.Gotham
+		messageLabel.TextSize = 15
+		messageLabel.TextXAlignment = Enum.TextXAlignment.Left
+		messageLabel.TextWrapped = true
+		messageLabel.Text = messageText
+		messageLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		messageLabel.AutomaticSize = Enum.AutomaticSize.Y
+		messageLabel.Size = UDim2.new(0, 200, 0, 0)
+		messageLabel.LayoutOrder = 3
+		messageLabel.ZIndex = 13
+		messageLabel.Parent = bubble
+		messageLabel.TextTransparency = 1
+
+		task.defer(function()
+			task.wait(0.1)
+			local function updateMessageWidth()
+				local bubbleWidth = bubble.AbsoluteSize.X
+				if bubbleWidth > 0 then
+					local iconWidth = (iconObj and (iconObj.AbsoluteSize.X + 6) or 0)
+					local usernameWidth = usernameLabel.AbsoluteSize.X
+					local availableWidth = math.max(bubbleWidth - iconWidth - usernameWidth - 22, 50)
+					messageLabel.Size = UDim2.new(0, availableWidth, 0, 0)
+				end
+			end
+			updateMessageWidth()
+			usernameLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateMessageWidth)
+			bubble:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateMessageWidth)
+		end)
+	end
+
+	task.defer(function()
+		local fadeIn = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(bubble, fadeIn, {BackgroundTransparency = isSystem and 0.2 or 0.35}):Play()
+		TweenService:Create(usernameLabel, fadeIn, {TextTransparency = 0}):Play()
+		if messageLabel then TweenService:Create(messageLabel, fadeIn, {TextTransparency = 0}):Play() end
+		if iconObj then TweenService:Create(iconObj, fadeIn, {ImageTransparency = 0}):Play() end
+	end)
+
+	task.defer(function()
+		resizeCanvas()
+		local contentHeight = listLayout.AbsoluteContentSize.Y
+		if contentHeight > messagesFrame.AbsoluteSize.Y then
+			messagesFrame.CanvasPosition = Vector2.new(0, contentHeight - messagesFrame.AbsoluteSize.Y + 8)
+		end
+	end)
+end
+
+local recentSystemMessages = {}
+
+addSystem = function(text)
+	text = tostring(text or "")
+	text = text:gsub("^%s*%[SYSTEM%]%s*", "")
+
+	local key = text:lower():gsub("%s+", " ")
+
+	if recentSystemMessages[key] then
+		return
+	end
+
+	recentSystemMessages[key] = true
+
+	task.delay(5, function()
+		recentSystemMessages[key] = nil
+	end)
+
+	addBubble("[SYSTEM] " .. text, systemTextColor, nil, true)
+end
+
+--------------------------------------------------------------------
+-- TYPING INDICATORS
+--------------------------------------------------------------------
+local activeTypingIndicators = {}
+local headTypingBubble = nil
+local headTypingAnimRunning = false
+
+local function removeHeadTypingBubble()
+	headTypingAnimRunning = false
+	local bubbleToRemove = headTypingBubble
+	headTypingBubble = nil
+	if bubbleToRemove and bubbleToRemove.Parent then
+		local fadeOut = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		for _, desc in ipairs(bubbleToRemove:GetDescendants()) do
+			if desc:IsA("Frame") then
+				TweenService:Create(desc, fadeOut, {BackgroundTransparency = 1}):Play()
+			end
+		end
+		TweenService:Create(bubbleToRemove, fadeOut, {Size = UDim2.new(0, bubbleToRemove.Size.X.Offset * 0.85, 0, bubbleToRemove.Size.Y.Offset * 0.85)}):Play()
+		task.delay(0.22, function()
+			if bubbleToRemove and bubbleToRemove.Parent then bubbleToRemove:Destroy() end
+		end)
+	end
+end
+
+local function createHeadTypingBubble()
+	removeHeadTypingBubble()
+	local character = localPlayer.Character
+	if not character then return end
+	local head = character:FindFirstChild("Head")
+	if not head then return end
+
+	local BUBBLE_W, BUBBLE_H = 70, 36
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "TypingHeadBubble"
+	billboard.Size = UDim2.new(0, BUBBLE_W, 0, BUBBLE_H)
+	local baseOffset = 2.6
+	local existingBubble = activeChatBubbles[localPlayer]
+	if existingBubble and existingBubble.gui and existingBubble.gui.Parent then
+		baseOffset = 4.4
+	end
+	billboard.StudsOffset = Vector3.new(0, baseOffset, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = 80
+	billboard.Adornee = head
+	billboard.Parent = head
+	headTypingBubble = billboard
+
+	local frame = Instance.new("Frame")
+	frame.BackgroundColor3 = Color3.fromRGB(30, 32, 38)
+	frame.BackgroundTransparency = 1
+	frame.BorderSizePixel = 0
+	frame.Size = UDim2.new(1, 0, 1, 0)
+	frame.Parent = billboard
+
+	do
+		local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0,10); corner.Parent = frame
+		local stroke = Instance.new("UIStroke"); stroke.Thickness = 1.5; stroke.Transparency = 1
+		stroke.Color = Color3.fromRGB(255,255,255); stroke.Parent = frame
+
+		local dotContainer = Instance.new("Frame")
+		dotContainer.BackgroundTransparency = 1
+		dotContainer.Size = UDim2.new(1, 0, 1, 0)
+		dotContainer.Parent = frame
+		local dotLayout = Instance.new("UIListLayout")
+		dotLayout.FillDirection = Enum.FillDirection.Horizontal
+		dotLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+		dotLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+		dotLayout.Padding = UDim.new(0, 5)
+		dotLayout.Parent = dotContainer
+
+		local dots = {}
+		for i = 1, 3 do
+			local dot = Instance.new("Frame")
+			dot.BackgroundColor3 = Color3.fromRGB(150, 150, 165)
+			dot.BackgroundTransparency = 0.2
+			dot.Size = UDim2.new(0, 8, 0, 8)
+			dot.BorderSizePixel = 0
+			dot.Parent = dotContainer
+			local dc = Instance.new("UICorner"); dc.CornerRadius = UDim.new(1,0); dc.Parent = dot
+			table.insert(dots, dot)
+		end
+
+		billboard.Size = UDim2.new(0, BUBBLE_W, 0, BUBBLE_H)
+		task.defer(function()
+			local popIn = TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+			TweenService:Create(billboard, popIn, {Size = UDim2.new(0, BUBBLE_W, 0, BUBBLE_H)}):Play()
+			TweenService:Create(frame, popIn, {BackgroundTransparency = 0.15}):Play()
+			TweenService:Create(stroke, popIn, {Transparency = 0.25}):Play()
+			for _, dot in ipairs(dots) do
+				TweenService:Create(dot, popIn, {BackgroundTransparency = 0.2}):Play()
+			end
+		end)
+
+		headTypingAnimRunning = true
+		task.spawn(function()
+			while headTypingAnimRunning and billboard and billboard.Parent do
+				for i, dot in ipairs(dots) do
+					task.delay((i-1)*0.16, function()
+						if not headTypingAnimRunning or not dot or not dot.Parent then return end
+						TweenService:Create(dot, TweenInfo.new(0.25,Enum.EasingStyle.Sine,Enum.EasingDirection.Out), {BackgroundColor3=Color3.fromRGB(240,240,255), BackgroundTransparency=0, Size=UDim2.new(0,9,0,9)}):Play()
+						task.delay(0.25, function()
+							if not headTypingAnimRunning or not dot or not dot.Parent then return end
+							TweenService:Create(dot, TweenInfo.new(0.25,Enum.EasingStyle.Sine,Enum.EasingDirection.In), {BackgroundColor3=Color3.fromRGB(150,150,165), BackgroundTransparency=0.2, Size=UDim2.new(0,7,0,7)}):Play()
+						end)
+					end)
+				end
+				task.wait(1.0)
+			end
+		end)
+	end
+
+	character.AncestryChanged:Connect(function()
+		if not character.Parent then removeHeadTypingBubble() end
+	end)
+end
+
+localPlayer.CharacterAdded:Connect(function() removeHeadTypingBubble() end)
+
+local function removeTypingIndicator(player)
+	local data = activeTypingIndicators[player]
+	if not data then return end
+	if data.stopAnimation then data.stopAnimation() end
+	for _, tw in ipairs(data.dotTweens or {}) do pcall(function() tw:Cancel() end) end
+	if data.frame and data.frame.Parent then
+		local fadeOut = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		TweenService:Create(data.frame, fadeOut, {BackgroundTransparency = 1}):Play()
+		for _, desc in ipairs(data.frame:GetDescendants()) do
+			if desc:IsA("ImageLabel") then TweenService:Create(desc, fadeOut, {ImageTransparency = 1}):Play()
+			elseif desc:IsA("Frame") then TweenService:Create(desc, fadeOut, {BackgroundTransparency = 1}):Play() end
+		end
+		task.delay(0.25, function()
+			if data.frame and data.frame.Parent then data.frame:Destroy() end
+		end)
+	end
+	if data.cleanupThread then pcall(function() task.cancel(data.cleanupThread) end) end
+	activeTypingIndicators[player] = nil
+	task.defer(resizeCanvas)
+end
+
+local function createTypingIndicator(player)
+	removeTypingIndicator(player)
+	local bubble = Instance.new("Frame")
+	bubble.Name = "TypingIndicator_" .. player.Name
+	bubble.BackgroundColor3 = Color3.fromRGB(38, 40, 47)
+	bubble.BackgroundTransparency = 1
+	bubble.BorderSizePixel = 0
+	bubble.Size = UDim2.new(1, 0, 0, 36)
+	bubble.ZIndex = 12
+	bubble.Parent = messagesFrame
+
+	local bc = Instance.new("UICorner")
+	bc.CornerRadius = UDim.new(0, 12)
+	bc.Parent = bubble
+
+	local p = Instance.new("UIPadding")
+	p.PaddingLeft = UDim.new(0, 8)
+	p.PaddingRight = UDim.new(0, 8)
+	p.PaddingTop = UDim.new(0, 6)
+	p.PaddingBottom = UDim.new(0, 6)
+	p.Parent = bubble
+
+	-- Horizontal layout: avatar | dots
+	local hl = Instance.new("UIListLayout")
+	hl.FillDirection = Enum.FillDirection.Horizontal
+	hl.VerticalAlignment = Enum.VerticalAlignment.Center
+	hl.HorizontalAlignment = Enum.HorizontalAlignment.Left
+	hl.Padding = UDim.new(0, 8)
+	hl.Parent = bubble
+
+	-- Avatar
+	local avatar = Instance.new("ImageLabel")
+	avatar.BackgroundTransparency = 1
+	avatar.Image = getThumbnail(player.UserId)
+	avatar.Size = UDim2.new(0, 22, 0, 22)
+	avatar.LayoutOrder = 1
+	avatar.ZIndex = 13
+	avatar.ImageTransparency = 1
+	avatar.Parent = bubble
+	local avatarCorner = Instance.new("UICorner")
+	avatarCorner.CornerRadius = UDim.new(1, 0)
+	avatarCorner.Parent = avatar
+
+	-- Dot container with fixed size
+	local dotContainer = Instance.new("Frame")
+	dotContainer.BackgroundTransparency = 1
+	dotContainer.Size = UDim2.new(0, 50, 0, 22)
+	dotContainer.LayoutOrder = 2
+	dotContainer.ZIndex = 13
+	dotContainer.Parent = bubble
+
+	local dl = Instance.new("UIListLayout")
+	dl.FillDirection = Enum.FillDirection.Horizontal
+	dl.VerticalAlignment = Enum.VerticalAlignment.Center
+	dl.HorizontalAlignment = Enum.HorizontalAlignment.Left
+	dl.Padding = UDim.new(0, 5)
+	dl.Parent = dotContainer
+
+	-- Name label
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text = player.Name .. " is typing..."
+	nameLabel.Font = Enum.Font.Gotham
+	nameLabel.TextSize = 12
+	nameLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	nameLabel.Size = UDim2.new(0, 140, 0, 22)
+	nameLabel.LayoutOrder = 3
+	nameLabel.ZIndex = 13
+	nameLabel.TextTransparency = 1
+	nameLabel.Parent = bubble
+
+	local dots = {}
+	for i = 1, 3 do
+		local dot = Instance.new("Frame")
+		dot.BackgroundColor3 = Color3.fromRGB(150, 150, 165)
+		dot.BackgroundTransparency = 0.3
+		dot.Size = UDim2.new(0, 7, 0, 7)
+		dot.BorderSizePixel = 0
+		dot.ZIndex = 14
+		dot.Parent = dotContainer
+		local dc = Instance.new("UICorner")
+		dc.CornerRadius = UDim.new(1, 0)
+		dc.Parent = dot
+		table.insert(dots, dot)
+	end
+
+	-- Fade in
+	task.defer(function()
+		local fi = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(bubble, fi, {BackgroundTransparency = 0.4}):Play()
+		TweenService:Create(avatar, fi, {ImageTransparency = 0}):Play()
+		TweenService:Create(nameLabel, fi, {TextTransparency = 0}):Play()
+	end)
+
+	local animRunning = true
+	local dotTweens = {}
+	task.spawn(function()
+		while animRunning and bubble and bubble.Parent do
+			for i, dot in ipairs(dots) do
+				task.delay((i - 1) * 0.18, function()
+					if not animRunning or not dot or not dot.Parent then return end
+					local up = TweenService:Create(dot,
+						TweenInfo.new(0.25, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+						{BackgroundColor3 = Color3.fromRGB(240, 240, 255), BackgroundTransparency = 0, Size = UDim2.new(0, 9, 0, 9)}
+					)
+					up:Play()
+					table.insert(dotTweens, up)
+					task.delay(0.25, function()
+						if not animRunning or not dot or not dot.Parent then return end
+						local down = TweenService:Create(dot,
+							TweenInfo.new(0.25, Enum.EasingStyle.Sine, Enum.EasingDirection.In),
+							{BackgroundColor3 = Color3.fromRGB(150, 150, 165), BackgroundTransparency = 0.3, Size = UDim2.new(0, 7, 0, 7)}
+						)
+						down:Play()
+						table.insert(dotTweens, down)
+					end)
+				end)
+			end
+			task.wait(1.1)
+		end
+	end)
+
+	activeTypingIndicators[player] = {
+		frame = bubble,
+		dotTweens = dotTweens,
+		stopAnimation = function() animRunning = false end,
+		cleanupThread = nil,
+	}
+	task.defer(resizeCanvas)
+end
+
+local activeHeadBubbles = {}
+
+local function removeOtherHeadBubble(player)
+	local data = activeHeadBubbles[player]
+	if not data then return end
+	data.running = false
+	if data.billboard and data.billboard.Parent then
+		local fadeOut = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		for _, desc in ipairs(data.billboard:GetDescendants()) do
+			if desc:IsA("Frame") then TweenService:Create(desc, fadeOut, {BackgroundTransparency = 1}):Play() end
+		end
+		TweenService:Create(data.billboard, fadeOut, {Size = UDim2.new(0, data.billboard.Size.X.Offset * 0.85, 0, data.billboard.Size.Y.Offset * 0.85)}):Play()
+		task.delay(0.22, function()
+			if data.billboard and data.billboard.Parent then data.billboard:Destroy() end
+		end)
+	end
+	activeHeadBubbles[player] = nil
+end
+
+local function createOtherHeadBubble(player)
+	removeOtherHeadBubble(player)
+	local character = player.Character
+	if not character then return end
+	local head = character:FindFirstChild("Head")
+	if not head then return end
+
+	local BUBBLE_W, BUBBLE_H = 70, 36
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "TypingHeadBubble"
+	billboard.Size = UDim2.new(0, BUBBLE_W, 0, BUBBLE_H)
+	-- Stack above any existing chat bubble
+	local existingBubble = activeChatBubbles[player]
+	local baseOffset = 2.6
+	if existingBubble and existingBubble.gui and existingBubble.gui.Parent then
+		baseOffset = 4.4
+	end
+	billboard.StudsOffset = Vector3.new(0, baseOffset, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = 80
+	billboard.Adornee = head
+	billboard.Parent = head
+
+	local frame = Instance.new("Frame")
+	frame.BackgroundColor3 = Color3.fromRGB(30, 32, 38)
+	frame.BackgroundTransparency = 1
+	frame.BorderSizePixel = 0
+	frame.Size = UDim2.new(1, 0, 1, 0)
+	frame.Parent = billboard
+
+	local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 10); corner.Parent = frame
+	local stroke = Instance.new("UIStroke"); stroke.Thickness = 1.5; stroke.Transparency = 1
+	stroke.Color = Color3.fromRGB(255, 255, 255); stroke.Parent = frame
+
+	local dotContainer = Instance.new("Frame")
+	dotContainer.BackgroundTransparency = 1
+	dotContainer.Size = UDim2.new(1, 0, 1, 0)
+	dotContainer.Parent = frame
+	local dotLayout = Instance.new("UIListLayout")
+	dotLayout.FillDirection = Enum.FillDirection.Horizontal
+	dotLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+	dotLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	dotLayout.Padding = UDim.new(0, 5)
+	dotLayout.Parent = dotContainer
+
+	local dots = {}
+	for i = 1, 3 do
+		local dot = Instance.new("Frame")
+		dot.BackgroundColor3 = Color3.fromRGB(150, 150, 165)
+		dot.BackgroundTransparency = 0.2
+		dot.Size = UDim2.new(0, 8, 0, 8)
+		dot.BorderSizePixel = 0
+		dot.Parent = dotContainer
+		local dc = Instance.new("UICorner"); dc.CornerRadius = UDim.new(1, 0); dc.Parent = dot
+		table.insert(dots, dot)
+	end
+
+	task.defer(function()
+		local popIn = TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		TweenService:Create(frame, popIn, {BackgroundTransparency = 0.15}):Play()
+		TweenService:Create(stroke, popIn, {Transparency = 0.25}):Play()
+		for _, dot in ipairs(dots) do
+			TweenService:Create(dot, popIn, {BackgroundTransparency = 0.2}):Play()
+		end
+	end)
+
+	local data = { billboard = billboard, running = true }
+	activeHeadBubbles[player] = data
+
+	task.spawn(function()
+		while data.running and billboard and billboard.Parent do
+			for i, dot in ipairs(dots) do
+				task.delay((i - 1) * 0.16, function()
+					if not data.running or not dot or not dot.Parent then return end
+					TweenService:Create(dot, TweenInfo.new(0.25, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {BackgroundColor3 = Color3.fromRGB(240, 240, 255), BackgroundTransparency = 0, Size = UDim2.new(0, 9, 0, 9)}):Play()
+					task.delay(0.25, function()
+						if not data.running or not dot or not dot.Parent then return end
+						TweenService:Create(dot, TweenInfo.new(0.25, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {BackgroundColor3 = Color3.fromRGB(150, 150, 165), BackgroundTransparency = 0.2, Size = UDim2.new(0, 7, 0, 7)}):Play()
+					end)
+				end)
+			end
+			task.wait(1.0)
+		end
+	end)
+
+	character.AncestryChanged:Connect(function()
+		if not character.Parent then removeOtherHeadBubble(player) end
+	end)
+end
+
+if TypingEvent then
+	TypingEvent.OnClientEvent:Connect(function(player, isTyping)
+		if mutedPlayers[player] or mutedByOthers[player] then
+			removeTypingIndicator(player)
+			removeOtherHeadBubble(player)
+			return
+		end
+		if isTyping then
+			createTypingIndicator(player)
+			createOtherHeadBubble(player)
+		else
+			removeTypingIndicator(player)
+			removeOtherHeadBubble(player)
+		end
+	end)
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+	removeTypingIndicator(plr)
+	removeOtherHeadBubble(plr)
+end)
+
+--------------------------------------------------------------------
+-- OPEN/CLOSE ANIMATION
+--------------------------------------------------------------------
+local chatFrameOriginalSize = chatFrame.Size
+local chatFrameOriginalPosition = chatFrame.Position
+
+local isAnimating = false
+local function setChatVisible(visible)
+	if isAnimating then return end
+	isAnimating = true
+
+	if visible then
+		chatToggleButton.Visible = false
+		chatFrame.Visible = true
+		chatFrame.BackgroundTransparency = 1
+		chatFrame.Size = UDim2.new(chatFrameOriginalSize.X.Scale, chatFrameOriginalSize.X.Offset*0.9, chatFrameOriginalSize.Y.Scale, chatFrameOriginalSize.Y.Offset*0.9)
+		chatFrame.Position = UDim2.new(chatFrameOriginalPosition.X.Scale, chatFrameOriginalPosition.X.Offset, chatFrameOriginalPosition.Y.Scale, chatFrameOriginalPosition.Y.Offset-10)
+
+		titleBar.BackgroundTransparency=1; inputFrame.BackgroundTransparency=1
+		titleLabel.TextTransparency=1; chatModeButton.TextTransparency=1
+		closeButton.TextTransparency=1; inputBox.TextTransparency=1
+		messagesFrame.ScrollBarImageTransparency=1
+
+		createSmoothTween(chatFrame, {BackgroundTransparency=CHAT_BG_TRANSPARENCY, Size=chatFrameOriginalSize, Position=chatFrameOriginalPosition}, 0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, function() isAnimating=false end)
+		createSmoothTween(titleBar, {BackgroundTransparency=TITLE_BG_TRANSPARENCY}, 0.3)
+		createSmoothTween(inputFrame, {BackgroundTransparency=INPUT_BG_TRANSPARENCY}, 0.3)
+		createSmoothTween(titleLabel, {TextTransparency=0}, 0.3)
+		createSmoothTween(chatModeButton, {TextTransparency=0}, 0.3)
+		createSmoothTween(closeButton, {TextTransparency=0}, 0.3)
+		createSmoothTween(inputBox, {TextTransparency=0}, 0.3)
+		createSmoothTween(messagesFrame, {ScrollBarImageTransparency=0.5}, 0.3)
+		createSmoothTween(chatStroke, {Transparency=0.3}, 0.3)
+		for _, child in ipairs(messagesFrame:GetChildren()) do
+			if child:IsA("Frame") and child.Name ~= "UIListLayout" then
+				child.BackgroundTransparency=1
+				for _, label in ipairs(child:GetDescendants()) do
+					if label:IsA("TextLabel") then label.TextTransparency=1
+					elseif label:IsA("ImageLabel") then label.ImageTransparency=1 end
+				end
+				createSmoothTween(child, {BackgroundTransparency=0.2}, 0.3)
+				for _, label in ipairs(child:GetDescendants()) do
+					if label:IsA("TextLabel") then createSmoothTween(label, {TextTransparency=0}, 0.3)
+					elseif label:IsA("ImageLabel") then createSmoothTween(label, {ImageTransparency=0}, 0.3) end
+				end
+			end
+		end
+	else
+		closeAllSidePanels()
+		toggleEmojiPicker(false)
+		toggleStickerPicker(false)
+		createSmoothTween(chatFrame, {BackgroundTransparency=1, Size=UDim2.new(chatFrameOriginalSize.X.Scale,chatFrameOriginalSize.X.Offset*0.9,chatFrameOriginalSize.Y.Scale,chatFrameOriginalSize.Y.Offset*0.9), Position=UDim2.new(chatFrameOriginalPosition.X.Scale,chatFrameOriginalPosition.X.Offset,chatFrameOriginalPosition.Y.Scale,chatFrameOriginalPosition.Y.Offset-10)}, 0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function() chatFrame.Visible=false; isAnimating=false end)
+		createSmoothTween(titleBar, {BackgroundTransparency=1}, 0.3)
+		createSmoothTween(inputFrame, {BackgroundTransparency=1}, 0.3)
+		createSmoothTween(titleLabel, {TextTransparency=1}, 0.3)
+		createSmoothTween(chatModeButton, {TextTransparency=1}, 0.3)
+		createSmoothTween(closeButton, {TextTransparency=1}, 0.3)
+		createSmoothTween(inputBox, {TextTransparency=1}, 0.3)
+		createSmoothTween(messagesFrame, {ScrollBarImageTransparency=1}, 0.3)
+		createSmoothTween(chatStroke, {Transparency=1}, 0.3)
+		for _, child in ipairs(messagesFrame:GetChildren()) do
+			if child:IsA("Frame") and child.Name ~= "UIListLayout" then
+				createSmoothTween(child, {BackgroundTransparency=1}, 0.3)
+				for _, label in ipairs(child:GetDescendants()) do
+					if label:IsA("TextLabel") then createSmoothTween(label, {TextTransparency=1}, 0.3)
+					elseif label:IsA("ImageLabel") then createSmoothTween(label, {ImageTransparency=1}, 0.3) end
+				end
+			end
+		end
+		task.delay(0.15, function()
+			chatToggleButton.Visible = true
+			chatToggleButton.BackgroundTransparency = 1
+			createSmoothTween(chatToggleButton, {BackgroundTransparency=0.2}, 0.2)
+		end)
+	end
+end
+
+closeButton.MouseButton1Click:Connect(function()
+	setChatVisible(false)
+	toggleEmojiPicker(false)
+end)
+chatToggleButton.MouseButton1Click:Connect(function()
+	setChatVisible(not chatFrame.Visible)
+end)
+
+task.wait(0.1)
+chatFrame.BackgroundTransparency=1
+chatFrame.Size=UDim2.new(chatFrameOriginalSize.X.Scale,chatFrameOriginalSize.X.Offset*0.95,chatFrameOriginalSize.Y.Scale,chatFrameOriginalSize.Y.Offset*0.95)
+chatFrame.Position=UDim2.new(chatFrameOriginalPosition.X.Scale,chatFrameOriginalPosition.X.Offset,chatFrameOriginalPosition.Y.Scale,chatFrameOriginalPosition.Y.Offset-5)
+titleBar.BackgroundTransparency=1; inputFrame.BackgroundTransparency=1; titleLabel.TextTransparency=1
+chatModeButton.TextTransparency=1; closeButton.TextTransparency=1; inputBox.TextTransparency=1
+messagesFrame.ScrollBarImageTransparency=1; chatStroke.Transparency=1
+
+task.wait(0.2)
+setChatVisible(true)
+print("SafetyChatClient: Chat set to visible with animation")
+
+--------------------------------------------------------------------
+-- sendMessage
+--------------------------------------------------------------------
+local sendMessage
+sendMessage = function(msg)
+	msg = string.gsub(msg, "^%s+", "")
+	msg = string.gsub(msg, "%s+$", "")
+	if string.lower(msg) == "/clear" then
+		for _, child in ipairs(messagesFrame:GetChildren()) do
+			if child:IsA("Frame") and child.Name ~= "UIListLayout" then child:Destroy() end
+		end
+		resizeCanvas()
+		return
+	end
+	if msg == "" then return end
+	if not ChatEvent or not ChatEvent:IsA("RemoteEvent") then
+		addSystem("Error: Chat system not ready. Please rejoin.")
+		return
+	end
+	local success, err = pcall(function()
+		if whisperTargetPlayer then
+			ChatEvent:FireServer(msg, whisperTargetPlayer)
+		else
+			ChatEvent:FireServer(msg, currentChatMode)
+		end
+	end)
+	if not success then
+		addSystem("Error sending message. Please try again.")
+		warn("Failed to fire ChatEvent:", err)
+	end
+end
+
+--------------------------------------------------------------------
+-- STICKER PICKER
+--------------------------------------------------------------------
+local stickerButton = Instance.new("TextButton")
+stickerButton.Name = "StickerButton"
+stickerButton.BackgroundTransparency = 1
+stickerButton.Text = "🎨"
+stickerButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+stickerButton.Font = Enum.Font.GothamBold
+stickerButton.TextSize = 16
+stickerButton.Size = UDim2.new(0, 26, 0, 26)
+stickerButton.Position = UDim2.new(1, -38, 0.5, 0)
+stickerButton.AnchorPoint = Vector2.new(1, 0.5)
+stickerButton.AutoButtonColor = false
+stickerButton.ZIndex = 13
+stickerButton.Parent = inputFrame
+
+do
+	local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0,8); sc.Parent = stickerButton
+	local ss = Instance.new("UIStroke"); ss.Thickness=1; ss.Transparency=1; ss.Color=Color3.fromRGB(255,255,255); ss.Parent=stickerButton
+end
+
+local stickerPickerFrame = Instance.new("Frame")
+stickerPickerFrame.Name = "StickerPicker"
+stickerPickerFrame.BackgroundColor3 = Color3.fromRGB(35, 37, 43)
+stickerPickerFrame.BackgroundTransparency = 0.1
+stickerPickerFrame.BorderSizePixel = 0
+stickerPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+stickerPickerFrame.Position = UDim2.new(0, 0, 0, 0)
+stickerPickerFrame.AnchorPoint = Vector2.new(0, 0)
+stickerPickerFrame.Visible = false
+stickerPickerFrame.ZIndex = 100
+stickerPickerFrame.Parent = screenGui
+
+do
+	local spc = Instance.new("UICorner"); spc.CornerRadius=UDim.new(0,12); spc.Parent=stickerPickerFrame
+	local sps = Instance.new("UIStroke"); sps.Thickness=1; sps.Transparency=0.2; sps.Color=Color3.fromRGB(255,255,255); sps.Parent=stickerPickerFrame
+	local sg = Instance.new("UIGridLayout")
+	sg.CellPadding=UDim2.new(0,8,0,8); sg.CellSize=UDim2.new(0,64,0,64)
+	sg.HorizontalAlignment=Enum.HorizontalAlignment.Center; sg.VerticalAlignment=Enum.VerticalAlignment.Center
+	sg.SortOrder=Enum.SortOrder.LayoutOrder; sg.StartCorner=Enum.StartCorner.TopLeft; sg.Parent=stickerPickerFrame
+	local sp2 = Instance.new("UIPadding")
+	sp2.PaddingTop=UDim.new(0,12); sp2.PaddingBottom=UDim.new(0,12)
+	sp2.PaddingLeft=UDim.new(0,12); sp2.PaddingRight=UDim.new(0,12); sp2.Parent=stickerPickerFrame
+end
+
+local stickerSet = {
+	{name = "RAHHHH", image = "rbxassetid://84901275809333"},
+	{name = "Sticker1a", image = "rbxassetid://82880579359009"},
+	{name = "Sticker1b", image = "rbxassetid://117736321880259"},
+	{name = "Sticker1c", image = "rbxassetid://96821807002416"},
+	{name = "Sticker2", image = "rbxassetid://81221154258567"},
+	{name = "Sticker3", image = "rbxassetid://105195554463918"},
+}
+
+print("=== STICKER SET LOADED ===")
+for i, sticker in ipairs(stickerSet) do print("Sticker", i, ":", sticker.name, sticker.image) end
+print("==========================")
+
+local stickerCols = 4
+local stickerRows = math.ceil(#stickerSet / stickerCols)
+local stickerPickerWidth = stickerCols * 72 + 24
+local stickerPickerHeight = stickerRows * 72 + 24
+stickerPickerFrame.Size = UDim2.new(0, stickerPickerWidth, 0, stickerPickerHeight)
+
+local function updateStickerPickerPosition()
+	if not stickerPickerFrame then return end
+	local inputPos = inputFrame.AbsolutePosition
+	local inputSize = inputFrame.AbsoluteSize
+	local screenSize = workspace.CurrentCamera.ViewportSize
+	local yPosition = inputPos.Y + (inputSize.Y/2) - (stickerPickerHeight/2) + 20
+	local xPosition = inputPos.X + inputSize.X + 14
+	if (xPosition + stickerPickerWidth + 8) > screenSize.X then
+		xPosition = inputPos.X - stickerPickerWidth - 14
+	end
+	yPosition = math.clamp(yPosition, 8, screenSize.Y - stickerPickerHeight - 8)
+	stickerPickerFrame.Position = UDim2.new(0, xPosition, 0, yPosition)
+end
+
+workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateStickerPickerPosition)
+inputFrame:GetPropertyChangedSignal("AbsolutePosition"):Connect(updateStickerPickerPosition)
+
+local stickerButtons = {}
+do
+	for i, sticker in ipairs(stickerSet) do
+		local stickerBtn = Instance.new("TextButton")
+		stickerBtn.Name = "Sticker_" .. i
+		stickerBtn.BackgroundColor3 = Color3.fromRGB(50, 52, 58)
+		stickerBtn.BackgroundTransparency = 0.5
+		stickerBtn.Size = UDim2.new(0, 64, 0, 64)
+		stickerBtn.AutoButtonColor = false
+		stickerBtn.ZIndex = 101; stickerBtn.LayoutOrder = i
+		stickerBtn.Parent = stickerPickerFrame; stickerBtn.Text = ""
+
+		local imageLabel = Instance.new("ImageLabel")
+		imageLabel.BackgroundTransparency = 1; imageLabel.Image = sticker.image
+		imageLabel.Size = UDim2.new(1,-8,1,-8); imageLabel.Position = UDim2.new(0.5,0,0.5,0)
+		imageLabel.AnchorPoint = Vector2.new(0.5,0.5); imageLabel.ZIndex = 102; imageLabel.Parent = stickerBtn
+		local ic = Instance.new("UICorner"); ic.CornerRadius=UDim.new(0,8); ic.Parent=imageLabel
+		local sbc = Instance.new("UICorner"); sbc.CornerRadius=UDim.new(0,12); sbc.Parent=stickerBtn
+		local sbs = Instance.new("UIStroke"); sbs.Thickness=1; sbs.Transparency=0.5; sbs.Color=Color3.fromRGB(255,255,255); sbs.Parent=stickerBtn
+		table.insert(stickerButtons, stickerBtn)
+
+		stickerBtn.MouseEnter:Connect(function()
+			createSmoothTween(stickerBtn, {BackgroundTransparency=0.1, BackgroundColor3=Color3.fromRGB(70,72,78), Size=UDim2.new(0,68,0,68)}, 0.15)
+			createSmoothTween(sbs, {Transparency=0.1, Thickness=2}, 0.15)
+			createSmoothTween(imageLabel, {Size=UDim2.new(1,-4,1,-4)}, 0.15)
+		end)
+		stickerBtn.MouseLeave:Connect(function()
+			createSmoothTween(stickerBtn, {BackgroundTransparency=0.5, BackgroundColor3=Color3.fromRGB(50,52,58), Size=UDim2.new(0,64,0,64)}, 0.15)
+			createSmoothTween(sbs, {Transparency=0.5, Thickness=1}, 0.15)
+			createSmoothTween(imageLabel, {Size=UDim2.new(1,-8,1,-8)}, 0.15)
+		end)
+	end
+end
+
+local isStickerPickerOpen = false
+
+toggleStickerPicker = function(show)
+	if isStickerPickerOpen == show then return end
+
+	-- Close emoji picker before opening stickers
+	if show and isEmojiPickerOpen then
+		toggleEmojiPicker(false)
+	end
+
+	isStickerPickerOpen = show
+
+	if show then
+		updateStickerPickerPosition()
+
+		stickerPickerFrame.Visible = true
+		stickerPickerFrame.BackgroundTransparency = 1
+		stickerPickerFrame.Size = UDim2.new(0, 0, 0, 0)
+
+		createSmoothTween(
+			stickerPickerFrame,
+			{
+				BackgroundTransparency = 0.1,
+				Size = UDim2.new(
+					0,
+					stickerPickerWidth,
+					0,
+					stickerPickerHeight
+				)
+			},
+			0.25,
+			Enum.EasingStyle.Back,
+			Enum.EasingDirection.Out
+		)
+
+		for i, btn in ipairs(stickerButtons) do
+			btn.BackgroundTransparency = 1
+			btn.Size = UDim2.new(0, 0, 0, 0)
+
+			local img = btn:FindFirstChildOfClass("ImageLabel")
+
+			if img then
+				img.ImageTransparency = 1
+			end
+
+			task.delay(i * 0.02, function()
+				-- FIX: Ignore outdated opening animation
+				if not isStickerPickerOpen then return end
+				if not btn or not btn.Parent then return end
+
+				createSmoothTween(
+					btn,
+					{
+						BackgroundTransparency = 0.5,
+						Size = UDim2.new(0, 64, 0, 64)
+					},
+					0.2,
+					Enum.EasingStyle.Back,
+					Enum.EasingDirection.Out
+				)
+
+				if img and img.Parent then
+					createSmoothTween(
+						img,
+						{ImageTransparency = 0},
+						0.15
+					)
+				end
+			end)
+		end
+
+		createSmoothTween(
+			stickerButton,
+			{
+				TextColor3 = Color3.fromRGB(200, 220, 255),
+				TextSize = 18
+			},
+			0.2
+		)
+
+	else
+		createSmoothTween(
+			stickerPickerFrame,
+			{
+				BackgroundTransparency = 1,
+				Size = UDim2.new(0, 0, 0, 0)
+			},
+			0.2,
+			Enum.EasingStyle.Quad,
+			Enum.EasingDirection.In,
+			function()
+				if not isStickerPickerOpen then
+					stickerPickerFrame.Visible = false
+				end
+			end
+		)
+
+		for i, btn in ipairs(stickerButtons) do
+			task.delay((#stickerButtons - i) * 0.01, function()
+				-- FIX: Don't let an old close animation affect a reopened picker
+				if isStickerPickerOpen then return end
+				if not btn or not btn.Parent then return end
+
+				createSmoothTween(
+					btn,
+					{
+						BackgroundTransparency = 1,
+						Size = UDim2.new(0, 0, 0, 0)
+					},
+					0.15
+				)
+
+				local img = btn:FindFirstChildOfClass("ImageLabel")
+
+				if img then
+					createSmoothTween(
+						img,
+						{ImageTransparency = 1},
+						0.15
+					)
+				end
+			end)
+		end
+
+		createSmoothTween(
+			stickerButton,
+			{
+				TextColor3 = Color3.fromRGB(255, 255, 255),
+				TextSize = 16
+			},
+			0.2
+		)
+	end
+end
+
+stickerButton.MouseButton1Click:Connect(function() toggleStickerPicker(not isStickerPickerOpen) end)
+stickerButton.MouseEnter:Connect(function()
+	if not isStickerPickerOpen then createSmoothTween(stickerButton, {TextSize=18, TextColor3=Color3.fromRGB(240,240,255)}, 0.15) end
+end)
+stickerButton.MouseLeave:Connect(function()
+	if not isStickerPickerOpen then createSmoothTween(stickerButton, {TextSize=16, TextColor3=Color3.fromRGB(255,255,255)}, 0.15) end
+end)
+
+for i, stickerBtn in ipairs(stickerButtons) do
+	stickerBtn.MouseButton1Click:Connect(function()
+		local sticker = stickerSet[i]
+		print("DIRECT CLICK - Sticker clicked:", sticker.name, sticker.image)
+		local success, err = pcall(function() sendMessage(sticker.image) end)
+		if not success then warn("Failed to send sticker:", err); addSystem("Error sending sticker") end
+		toggleStickerPicker(false)
+	end)
+end
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if isStickerPickerOpen and input.UserInputType == Enum.UserInputType.MouseButton1 then
+		local mousePos = UserInputService:GetMouseLocation()
+		local sp = stickerPickerFrame.AbsolutePosition; local ss2 = stickerPickerFrame.AbsoluteSize
+		local sbp = stickerButton.AbsolutePosition; local sbs2 = stickerButton.AbsoluteSize
+		local inPicker = mousePos.X>=sp.X and mousePos.X<=sp.X+ss2.X and mousePos.Y>=sp.Y and mousePos.Y<=sp.Y+ss2.Y
+		local inButton = mousePos.X>=sbp.X and mousePos.X<=sbp.X+sbs2.X and mousePos.Y>=sbp.Y and mousePos.Y<=sbp.Y+sbs2.Y
+		if not inPicker and not inButton then toggleStickerPicker(false) end
+	end
+	if input.KeyCode == Enum.KeyCode.Escape and isStickerPickerOpen then toggleStickerPicker(false) end
+end)
+
+closeButton.MouseButton1Click:Connect(function() toggleStickerPicker(false) end)
+
+task.wait(0.1)
+updateStickerPickerPosition()
+print("SafetyChatClient: Sticker picker feature added with", #stickerSet, "stickers")
+
+--------------------------------------------------------------------
+-- TYPING STATE
+--------------------------------------------------------------------
+local typingDebounceThread = nil
+local wasTyping = false
+local lastTypingText = ""
+
+local function sendTypingState(typing)
+	if wasTyping == typing then return end
+	wasTyping = typing
+	pcall(function() TypingEvent:FireServer(typing, currentChatMode, whisperTargetPlayer) end)
+	if typing then createHeadTypingBubble() else removeHeadTypingBubble() end
+end
+
+inputBox:GetPropertyChangedSignal("Text"):Connect(function()
+	local text = inputBox.Text
+	if typingDebounceThread then task.cancel(typingDebounceThread); typingDebounceThread = nil end
+	if text ~= "" and text ~= lastTypingText then
+		sendTypingState(true)
+		lastTypingText = text
+		typingDebounceThread = task.delay(3, function()
+			sendTypingState(false); typingDebounceThread = nil
+		end)
+	elseif text == "" then
+		sendTypingState(false); lastTypingText = ""
+	end
+end)
+
+inputBox.FocusLost:Connect(function(enterPressed)
+	sendTypingState(false)
+	if typingDebounceThread then task.cancel(typingDebounceThread); typingDebounceThread = nil end
+	lastTypingText = ""
+	if enterPressed then
+		local text = inputBox.Text
+		inputBox.Text = ""
+		sendMessage(text)
+	end
+end)
+
+inputBox:GetPropertyChangedSignal("Text"):Connect(function()
+	if inputBox.Text == "" and whisperTargetPlayer then
+		whisperTargetPlayer = nil
+		inputBox.PlaceholderText = "Type a message..."
+	end
+end)
+
+--------------------------------------------------------------------
+-- SLASH KEY
+--------------------------------------------------------------------
+local ContextActionService = game:GetService("ContextActionService")
+local function OpenChatBySlash(actionName, inputState, inputObject)
+	if inputState ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+	if inputBox and inputBox:IsFocused() then return Enum.ContextActionResult.Pass end
+	if not chatFrame.Visible then setChatVisible(true); task.wait(0.05) end
+	inputBox:CaptureFocus()
+	if inputBox.Text:sub(1,1) == "/" or inputBox.Text:sub(1,1) == "-" then inputBox.Text = inputBox.Text:sub(2) end
+	task.defer(function()
+		if inputBox and inputBox.Parent then
+			if inputBox.Text:sub(1,1) == "/" or inputBox.Text:sub(1,1) == "-" then inputBox.Text = inputBox.Text:sub(2); inputBox.CursorPosition = #inputBox.Text + 1 end
+			inputBox.CursorPosition = #inputBox.Text + 1
+		end
+	end)
+	task.delay(0.1, function()
+		if inputBox and inputBox.Parent and inputBox:IsFocused() then
+			if inputBox.Text:sub(1,1) == "/" or inputBox.Text:sub(1,1) == "-" then inputBox.Text = inputBox.Text:sub(2); inputBox.CursorPosition = #inputBox.Text + 1 end
+		end
+	end)
+	return Enum.ContextActionResult.Sink
+end
+ContextActionService:BindActionAtPriority("OpenChatBySlash", OpenChatBySlash, false, Enum.ContextActionPriority.High.Value + 10, Enum.KeyCode.Slash)
+
+--------------------------------------------------------------------
+-- BLOCK TYPING INDICATORS FOR MUTED
+--------------------------------------------------------------------
+TextChatService.OnIncomingMessage = function(message)
+	local textSource = message.TextSource
+	if textSource then
+		local player = Players:GetPlayerByUserId(textSource.UserId)
+		if player and isMuted(player) then return nil end
+	end
+	return message
+end
+
+--------------------------------------------------------------------
+-- RECEIVE MESSAGES
+--------------------------------------------------------------------
+if ChatEvent then
+	ChatEvent.OnClientEvent:Connect(function(fromName, text, _, isWhisper, fromPlayer, roleInfo)
+		if typeof(fromName) ~= "string" or typeof(text) ~= "string" then return end
+
+		if fromName == "BUBBLE" then
+			if isWhisper then
+				if fromPlayer ~= Players.LocalPlayer and whisperTargetPlayer ~= fromPlayer then return end
+			end
+			if typeof(fromPlayer) == "Instance" and fromPlayer:IsA("Player") then
+				if not mutedPlayers[fromPlayer] and not mutedByOthers[fromPlayer] then
+					createChatBubble(fromPlayer, text)
+				end
+			end
+			return
+		end
+
+		if fromName == "Sticker" then
+			-- Don't show stickers from muted players
+			if typeof(fromPlayer) == "Instance" and fromPlayer:IsA("Player") then
+				if mutedPlayers[fromPlayer] or mutedByOthers[fromPlayer] then return end
+			end
+			createStickerBubble(fromPlayer, text)
+			if typeof(fromPlayer) == "Instance" and fromPlayer:IsA("Player") then
+				print("RECEIVED STICKER from", fromPlayer.Name, "- URL:", text)
+				do
+					local stickerBubble = Instance.new("Frame")
+					stickerBubble.BackgroundColor3 = Color3.fromRGB(45, 47, 53)
+					stickerBubble.BackgroundTransparency = 0.35
+					stickerBubble.BorderSizePixel = 0
+					stickerBubble.Size = UDim2.new(1, 0, 0, 0)
+					stickerBubble.AutomaticSize = Enum.AutomaticSize.Y
+					stickerBubble.ZIndex = 12
+					stickerBubble.Parent = messagesFrame
+					local bc = Instance.new("UICorner"); bc.CornerRadius=UDim.new(0,12); bc.Parent=stickerBubble
+					local p2 = Instance.new("UIPadding")
+					p2.PaddingLeft=UDim.new(0,8); p2.PaddingRight=UDim.new(0,8)
+					p2.PaddingTop=UDim.new(0,8); p2.PaddingBottom=UDim.new(0,8); p2.Parent=stickerBubble
+					local vLayout = Instance.new("UIListLayout")
+					vLayout.FillDirection=Enum.FillDirection.Vertical; vLayout.HorizontalAlignment=Enum.HorizontalAlignment.Left
+					vLayout.VerticalAlignment=Enum.VerticalAlignment.Top; vLayout.Padding=UDim.new(0,8); vLayout.Parent=stickerBubble
+					local nameColor = fromPlayer.Team and fromPlayer.Team.TeamColor.Color or Color3.fromRGB(255,255,255)
+					local usernameLabel = Instance.new("TextLabel")
+					usernameLabel.BackgroundTransparency=1; usernameLabel.Font=Enum.Font.GothamBold; usernameLabel.TextSize=15
+					usernameLabel.Text=fromPlayer.Name..":"; usernameLabel.TextColor3=nameColor
+					usernameLabel.Size=UDim2.new(1,0,0,20); usernameLabel.TextXAlignment=Enum.TextXAlignment.Left
+					usernameLabel.ZIndex=13; usernameLabel.Parent=stickerBubble
+					local imageLabel = Instance.new("ImageLabel")
+					imageLabel.BackgroundTransparency=1; imageLabel.Image=text
+					imageLabel.Size=UDim2.new(0,64,0,64); imageLabel.Position=UDim2.new(0,0,0,0)
+					imageLabel.ZIndex=13; imageLabel.Parent=stickerBubble
+					local imgCorner = Instance.new("UICorner"); imgCorner.CornerRadius=UDim.new(0,8); imgCorner.Parent=imageLabel
+					stickerBubble.BackgroundTransparency=1; usernameLabel.TextTransparency=1; imageLabel.ImageTransparency=1
+					task.defer(function()
+						local fadeIn = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+						TweenService:Create(stickerBubble, fadeIn, {BackgroundTransparency=0.35}):Play()
+						TweenService:Create(usernameLabel, fadeIn, {TextTransparency=0}):Play()
+						TweenService:Create(imageLabel, fadeIn, {ImageTransparency=0}):Play()
+					end)
+					task.delay(8, function()
+						if stickerBubble and stickerBubble.Parent then
+							local fadeOut = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+							TweenService:Create(stickerBubble, fadeOut, {BackgroundTransparency=1}):Play()
+							TweenService:Create(usernameLabel, fadeOut, {TextTransparency=1}):Play()
+							TweenService:Create(imageLabel, fadeOut, {ImageTransparency=1}):Play()
+							task.delay(0.3, function()
+								if stickerBubble and stickerBubble.Parent then stickerBubble:Destroy(); resizeCanvas() end
+							end)
+						end
+					end)
+					task.defer(function() resizeCanvas() end)
+				end
+			end
+			return
+		end
+
+		if fromName == "System" then addSystem(text); return end
+
+		local userId = 0
+		local playerTeam = nil
+		if typeof(fromPlayer) == "Instance" and fromPlayer:IsA("Player") then
+			userId = fromPlayer.UserId
+			playerTeam = fromPlayer.Team
+			if mutedPlayers[fromPlayer] then return end
+			local fromId = fromPlayer.UserId
+			for mutedPlayer, _ in pairs(mutedByOthers) do
+				if typeof(mutedPlayer) == "Instance" and mutedPlayer:IsA("Player") then
+					if mutedPlayer.UserId == fromId then return end
+				end
+			end
+		end
+
+		local nameColor = Color3.fromRGB(255, 255, 255)
+		if playerTeam and playerTeam.TeamColor then nameColor = playerTeam.TeamColor.Color end
+
+		local prefix
+		if isWhisper then
+			if string.find(fromName, "You ->") then
+				prefix = "Whisper to " .. string.gsub(fromName, "You -> ", "") .. ": "
+			else
+				prefix = "Whisper from " .. fromName .. ": "
+			end
+		else
+			prefix = fromName .. ": "
+		end
+		addBubble(prefix .. text, nameColor, userId, false, roleInfo)
+	end)
+else
+	warn("ChatEvent not found - messages won't be received")
+end
+
+--------------------------------------------------------------------
+-- INTRO
+--------------------------------------------------------------------
+task.wait(0.5)
+addSystem("Custom chat loaded. All messages go through a safety filter first.")
+addSystem("Type /e dance, /e wave, or /e <emotename> to use emotes!")
+
+--------------------------------------------------------------------
+-- MUTE BUTTON
+--------------------------------------------------------------------
+local muteButton = Instance.new("TextButton")
+muteButton.Name = "MuteButton"
+muteButton.BackgroundTransparency = 1
+muteButton.Font = Enum.Font.GothamBold
+muteButton.TextSize = 16
+muteButton.TextColor3 = Color3.fromRGB(220, 220, 255)
+muteButton.Text = "🔇"
+muteButton.AnchorPoint = Vector2.new(1, 0)
+muteButton.Position = UDim2.new(1, -62, 0, 0)
+muteButton.Size = UDim2.new(0, 26, 1, 0)
+muteButton.AutoButtonColor = false
+muteButton.ZIndex = 15
+muteButton.ClipsDescendants = true
+muteButton.Parent = titleBar
+
+chatModeButton.Position = UDim2.new(1, -132, 0, 0)
+chatModeButtonClick.Position = UDim2.new(1, -96, 0, 0)
+settingsButton.Position = UDim2.new(1, -34, 0, 0)
+
+local muteBaseColor = muteButton.TextColor3
+local isMuteButtonHovering = false
+local muteHoverTween = nil
+local muteButtonAnimating = false
+
+local function animateMuteButton(props, duration, easing, direction, callback)
+	if muteButtonAnimating then
+		if muteHoverTween then muteHoverTween:Cancel(); muteHoverTween = nil end
+	end
+	muteButtonAnimating = true
+	muteHoverTween = createSmoothTween(muteButton, props, duration, easing, direction, function()
+		muteButtonAnimating = false
+		if callback then callback() end
+	end)
+end
+
+muteButton.MouseEnter:Connect(function()
+	if isMuteButtonHovering then return end
+	isMuteButtonHovering = true
+	animateMuteButton({TextColor3=Color3.fromRGB(255,100,100), TextSize=18, Rotation=-5}, 0.2)
+end)
+muteButton.MouseLeave:Connect(function()
+	isMuteButtonHovering = false
+	animateMuteButton({TextColor3=muteBaseColor, TextSize=16, Rotation=0}, 0.2)
+end)
+muteButton.MouseButton1Down:Connect(function()
+	animateMuteButton({TextSize=14, Rotation=10}, 0.06)
+end)
+muteButton.MouseButton1Up:Connect(function()
+	animateMuteButton({TextSize=18, Rotation=-5}, 0.08, nil, nil, function()
+		animateMuteButton({Rotation=0}, 0.1)
+	end)
+end)
+
+local function isPlayerMuted(targetPlayer)
+	return mutedPlayers[targetPlayer] ~= nil
+end
+
+local function getCooldownRemaining(targetPlayer)
+	local cooldown = muteCooldowns[targetPlayer]
+	if not cooldown then return 0 end
+	return math.max(0, cooldown - os.time())
+end
+
+local function sendMuteNotification(targetPlayer, isMute)
+	local MuteEvent = ReplicatedStorage:FindFirstChild("MuteEvent")
+	if MuteEvent then MuteEvent:FireServer(isMute and "mute" or "unmute", targetPlayer) end
+end
+
+--------------------------------------------------------------------
+-- MUTE PANEL
+--------------------------------------------------------------------
+local mutePanel = Instance.new("Frame")
+mutePanel.Name = "MutePlayerPanel"
+mutePanel.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
+mutePanel.BackgroundTransparency = 0.05
+mutePanel.BorderSizePixel = 0
+mutePanel.Size = UDim2.new(0, 0, 0, 0)
+mutePanel.Position = UDim2.new(1, -320, 0, 80)
+mutePanel.AnchorPoint = Vector2.new(0, 0)
+mutePanel.ZIndex = 50
+mutePanel.Visible = false
+mutePanel.ClipsDescendants = true
+mutePanel.Parent = screenGui
+
+do
+	local mpc = Instance.new("UICorner"); mpc.CornerRadius=UDim.new(0,16); mpc.Parent=mutePanel
+end
+
+local mutePanelStroke = Instance.new("UIStroke")
+mutePanelStroke.Thickness=1.5; mutePanelStroke.Transparency=0.4
+mutePanelStroke.Color=Color3.fromRGB(255,255,255); mutePanelStroke.Parent=mutePanel
+
+local mutePanelHeader = Instance.new("Frame")
+mutePanelHeader.Name="MutePanelHeader"; mutePanelHeader.BackgroundColor3=Color3.fromRGB(30,32,38)
+mutePanelHeader.BackgroundTransparency=0.1; mutePanelHeader.BorderSizePixel=0
+mutePanelHeader.Size=UDim2.new(1,0,0,48); mutePanelHeader.ZIndex=51; mutePanelHeader.ClipsDescendants=true
+mutePanelHeader.Parent=mutePanel
+do
+	local mhc = Instance.new("UICorner"); mhc.CornerRadius=UDim.new(0,16); mhc.Parent=mutePanelHeader
+end
+
+local mutePanelTitle = Instance.new("TextLabel")
+mutePanelTitle.BackgroundTransparency=1; mutePanelTitle.Text="🔇 Mute Players"
+mutePanelTitle.Font=Enum.Font.GothamBold; mutePanelTitle.TextSize=16
+mutePanelTitle.TextColor3=Color3.fromRGB(255,255,255); mutePanelTitle.Size=UDim2.new(1,-40,1,0)
+mutePanelTitle.Position=UDim2.new(0,16,0,0); mutePanelTitle.TextXAlignment=Enum.TextXAlignment.Left
+mutePanelTitle.ZIndex=52; mutePanelTitle.Parent=mutePanelHeader
+
+local mutePanelClose = Instance.new("TextButton")
+mutePanelClose.BackgroundTransparency=1; mutePanelClose.Font=Enum.Font.GothamBold
+mutePanelClose.TextSize=20; mutePanelClose.TextColor3=Color3.fromRGB(255,255,255)
+mutePanelClose.Text="×"; mutePanelClose.Position=UDim2.new(1,-36,0,0)
+mutePanelClose.Size=UDim2.new(0,36,1,0); mutePanelClose.AutoButtonColor=false
+mutePanelClose.ZIndex=52; mutePanelClose.Parent=mutePanelHeader
+
+mutePanelClose.MouseEnter:Connect(function()
+	createSmoothTween(mutePanelClose, {TextColor3=Color3.fromRGB(255,100,100), TextSize=22}, 0.15)
+end)
+mutePanelClose.MouseLeave:Connect(function()
+	createSmoothTween(mutePanelClose, {TextColor3=Color3.fromRGB(255,255,255), TextSize=20}, 0.15)
+end)
+
+--------------------------------------------------------------------
+-- SEARCH BAR
+--------------------------------------------------------------------
+local searchContainer = Instance.new("Frame")
+searchContainer.Name="SearchContainer"; searchContainer.BackgroundColor3=Color3.fromRGB(35,37,43)
+searchContainer.BackgroundTransparency=0.2; searchContainer.BorderSizePixel=0
+searchContainer.Size=UDim2.new(1,-16,0,36); searchContainer.Position=UDim2.new(0,8,0,56)
+searchContainer.ZIndex=52; searchContainer.Parent=mutePanel
+do
+	local sc2 = Instance.new("UICorner"); sc2.CornerRadius=UDim.new(0,12); sc2.Parent=searchContainer
+end
+
+do
+	local searchIcon = Instance.new("TextLabel")
+	searchIcon.BackgroundTransparency=1; searchIcon.Text="🔍"; searchIcon.Font=Enum.Font.Gotham
+	searchIcon.TextSize=16; searchIcon.TextColor3=Color3.fromRGB(180,180,180)
+	searchIcon.Size=UDim2.new(0,30,1,0); searchIcon.Position=UDim2.new(0,8,0,0)
+	searchIcon.ZIndex=53; searchIcon.Parent=searchContainer
+end
+
+local searchBox = Instance.new("TextBox")
+searchBox.Name="SearchBox"; searchBox.BackgroundTransparency=1; searchBox.Text=""
+searchBox.PlaceholderText="Search username..."; searchBox.PlaceholderColor3=Color3.fromRGB(140,140,150)
+searchBox.Font=Enum.Font.Gotham; searchBox.TextSize=14; searchBox.TextColor3=Color3.fromRGB(255,255,255)
+searchBox.TextXAlignment=Enum.TextXAlignment.Left; searchBox.Size=UDim2.new(1,-74,1,0)
+searchBox.Position=UDim2.new(0,40,0,0); searchBox.ClearTextOnFocus=false; searchBox.ZIndex=53
+searchBox.Parent=searchContainer
+
+local clearSearchButton = Instance.new("TextButton")
+clearSearchButton.BackgroundTransparency=1; clearSearchButton.Font=Enum.Font.GothamBold
+clearSearchButton.TextSize=18; clearSearchButton.TextColor3=Color3.fromRGB(255,255,255)
+clearSearchButton.Text="×"; clearSearchButton.AnchorPoint=Vector2.new(1,0)
+clearSearchButton.Position=UDim2.new(1,-8,0,0); clearSearchButton.Size=UDim2.new(0,34,1,0)
+clearSearchButton.AutoButtonColor=false; clearSearchButton.Active=true; clearSearchButton.ZIndex=60
+clearSearchButton.Visible=false; clearSearchButton.Parent=searchContainer
+
+do
+	local clearBase = clearSearchButton.TextColor3
+	clearSearchButton.MouseEnter:Connect(function()
+		createSmoothTween(clearSearchButton, {TextColor3=Color3.fromRGB(255,100,100), TextSize=20}, 0.15)
+	end)
+	clearSearchButton.MouseLeave:Connect(function()
+		createSmoothTween(clearSearchButton, {TextColor3=clearBase, TextSize=18}, 0.15)
+	end)
+end
+
+local mutePlayerList = Instance.new("ScrollingFrame")
+mutePlayerList.Name="MutePlayerList"; mutePlayerList.BackgroundTransparency=1; mutePlayerList.BorderSizePixel=0
+mutePlayerList.Position=UDim2.new(0,8,0,100); mutePlayerList.Size=UDim2.new(1,-16,1,-116)
+mutePlayerList.ScrollBarThickness=4; mutePlayerList.ScrollBarImageColor3=Color3.fromRGB(200,200,200)
+mutePlayerList.ScrollBarImageTransparency=0.6; mutePlayerList.CanvasSize=UDim2.new(0,0,0,0)
+mutePlayerList.ZIndex=51; mutePlayerList.Parent=mutePanel
+
+local mutePlayerListLayout = Instance.new("UIListLayout")
+mutePlayerListLayout.SortOrder=Enum.SortOrder.Name; mutePlayerListLayout.Padding=UDim.new(0,6)
+mutePlayerListLayout.Parent=mutePlayerList
+
+mutePlayerListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	mutePlayerList.CanvasSize = UDim2.new(0, 0, 0, mutePlayerListLayout.AbsoluteContentSize.Y + 8)
+end)
+
+--------------------------------------------------------------------
+-- MUTE PANEL TOGGLE
+--------------------------------------------------------------------
+local isMutePanelOpen = false
+local mutePanelTween = nil
+
+-- forward declare for refreshMutePlayerList and createPlayerEntry
+local refreshMutePlayerList
+local createPlayerEntry
+
+toggleMutePanel = function(show)
+	if isMutePanelOpen == show then return end
+	if mutePanelTween then mutePanelTween:Cancel(); mutePanelTween = nil end
+	isMutePanelOpen = show
+	if show then
+		closeAllSidePanels("mute")
+		refreshMutePlayerList()
+		mutePanel.Visible = true
+		mutePanel.Size = UDim2.new(0, 0, 0, 0)
+		mutePanel.BackgroundTransparency = 1
+		mutePanelStroke.Transparency = 1
+		mutePanelTween = createSmoothTween(mutePanel, {BackgroundTransparency=0.05, Size=UDim2.new(0,300,0,400)}, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out, function() mutePanelTween=nil end)
+		createSmoothTween(mutePanelStroke, {Transparency=0.4}, 0.25)
+		createSmoothTween(muteButton, {TextColor3=Color3.fromRGB(255,150,150), TextSize=18}, 0.2)
+		searchBox.Text = ""
+	else
+		mutePanelTween = createSmoothTween(mutePanel, {BackgroundTransparency=1, Size=UDim2.new(0,0,0,0)}, 0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In, function() mutePanel.Visible=false; mutePanelTween=nil end)
+		createSmoothTween(mutePanelStroke, {Transparency=1}, 0.2)
+		createSmoothTween(muteButton, {TextColor3=muteBaseColor, TextSize=16}, 0.2)
+	end
+end
+
+closeAllSidePanels = function(except)
+	if settingsOpen and except ~= "settings" then
+		toggleSettingsPanel()
+	end
+	if ownerPanelOpen and except ~= "owner" then
+		toggleOwnerPanel()
+	end
+	if isMutePanelOpen and except ~= "mute" then
+		toggleMutePanel(false)
+	end
+end
+
+muteButton.MouseButton1Click:Connect(function() toggleMutePanel(not isMutePanelOpen) end)
+mutePanelClose.MouseButton1Click:Connect(function() toggleMutePanel(false) end)
+
+clearSearchButton.MouseButton1Click:Connect(function()
+	searchBox.Text = ""
+	clearSearchButton.Visible = false
+	refreshMutePlayerList()
+	searchBox:CaptureFocus()
+end)
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+	clearSearchButton.Visible = #searchBox.Text > 0
+	refreshMutePlayerList()
+end)
+
+--------------------------------------------------------------------
+-- REFRESH PLAYER LIST
+--------------------------------------------------------------------
+refreshMutePlayerList = function()
+	for _, child in ipairs(mutePlayerList:GetChildren()) do
+		if child:IsA("Frame") and child.Name == "PlayerEntry" then child:Destroy() end
+	end
+	local oldNoResults = mutePlayerList:FindFirstChild("NoResultsLabel")
+	if oldNoResults then oldNoResults:Destroy() end
+
+	local searchTerm = string.lower(searchBox.Text or "")
+	local players = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= localPlayer then table.insert(players, player) end
+	end
+	table.sort(players, function(a, b) return a.Name:lower() < b.Name:lower() end)
+
+	local visibleCount = 0
+	for _, player in ipairs(players) do
+		if searchTerm == "" or string.find(player.Name:lower(), searchTerm, 1, true) then
+			createPlayerEntry(player)
+			visibleCount = visibleCount + 1
+		end
+	end
+	if visibleCount == 0 and #searchTerm > 0 then
+		local noResults = Instance.new("TextLabel")
+		noResults.Name="NoResultsLabel"; noResults.BackgroundTransparency=1
+		noResults.Text="🔍 No players found"; noResults.Font=Enum.Font.Gotham
+		noResults.TextSize=14; noResults.TextColor3=Color3.fromRGB(180,180,180)
+		noResults.Size=UDim2.new(1,0,0,40); noResults.ZIndex=52; noResults.Parent=mutePlayerList
+	end
+end
+
+--------------------------------------------------------------------
+-- CREATE PLAYER ENTRY
+--------------------------------------------------------------------
+createPlayerEntry = function(targetPlayer)
+	local entry = Instance.new("Frame")
+	entry.Name="PlayerEntry"; entry.BackgroundColor3=Color3.fromRGB(35,37,43)
+	entry.BackgroundTransparency=0.2; entry.BorderSizePixel=0
+	entry.Size=UDim2.new(1,0,0,56); entry.ZIndex=52; entry.Parent=mutePlayerList
+	local ec = Instance.new("UICorner"); ec.CornerRadius=UDim.new(0,12); ec.Parent=entry
+
+	local avatar = Instance.new("ImageLabel")
+	avatar.BackgroundTransparency=1; avatar.Image=getThumbnail(targetPlayer.UserId)
+	avatar.Size=UDim2.new(0,40,0,40); avatar.Position=UDim2.new(0,8,0.5,0)
+	avatar.AnchorPoint=Vector2.new(0,0.5); avatar.ZIndex=53; avatar.Parent=entry
+	local ac = Instance.new("UICorner"); ac.CornerRadius=UDim.new(1,0); ac.Parent=avatar
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.BackgroundTransparency=1; nameLabel.Text=targetPlayer.Name
+	nameLabel.Font=Enum.Font.GothamBold; nameLabel.TextSize=15
+	nameLabel.TextColor3=Color3.fromRGB(255,255,255); nameLabel.Size=UDim2.new(0,140,0,20)
+	nameLabel.Position=UDim2.new(0,56,0.5,-10); nameLabel.TextXAlignment=Enum.TextXAlignment.Left
+	nameLabel.ZIndex=53; nameLabel.Parent=entry
+
+	if targetPlayer.Team then
+		local teamLabel = Instance.new("TextLabel")
+		teamLabel.BackgroundTransparency=1; teamLabel.Text=targetPlayer.Team.Name
+		teamLabel.Font=Enum.Font.Gotham; teamLabel.TextSize=11
+		teamLabel.TextColor3=targetPlayer.Team.TeamColor and targetPlayer.Team.TeamColor.Color or Color3.fromRGB(160,160,160)
+		teamLabel.Size=UDim2.new(0,140,0,16); teamLabel.Position=UDim2.new(0,56,0.5,8)
+		teamLabel.TextXAlignment=Enum.TextXAlignment.Left; teamLabel.ZIndex=53; teamLabel.Parent=entry
+	end
+
+	local actionButton = Instance.new("TextButton")
+	actionButton.Name="ActionButton"
+	actionButton.BackgroundColor3=isPlayerMuted(targetPlayer) and Color3.fromRGB(70,90,110) or Color3.fromRGB(60,70,90)
+	actionButton.BackgroundTransparency=0.1; actionButton.Font=Enum.Font.GothamBold
+	actionButton.TextSize=13; actionButton.TextColor3=Color3.fromRGB(255,255,255)
+	actionButton.Text=isPlayerMuted(targetPlayer) and "Unmute" or "Mute"
+	actionButton.Size=UDim2.new(0,80,0,32); actionButton.Position=UDim2.new(1,-12,0.5,0)
+	actionButton.AnchorPoint=Vector2.new(1,0.5); actionButton.AutoButtonColor=false
+	actionButton.ZIndex=53; actionButton.Parent=entry
+	local abc = Instance.new("UICorner"); abc.CornerRadius=UDim.new(0,16); abc.Parent=actionButton
+
+	local cooldownRemaining = getCooldownRemaining(targetPlayer)
+	if cooldownRemaining > 0 then
+		local cooldownLabel = Instance.new("TextLabel")
+		cooldownLabel.Name="CooldownLabel"; cooldownLabel.BackgroundTransparency=1
+		cooldownLabel.Text="⏳"..math.ceil(cooldownRemaining).."s"; cooldownLabel.Font=Enum.Font.Gotham
+		cooldownLabel.TextSize=11; cooldownLabel.TextColor3=Color3.fromRGB(180,180,180)
+		cooldownLabel.Size=UDim2.new(0,50,0,20); cooldownLabel.Position=UDim2.new(1,-100,0.5,0)
+		cooldownLabel.AnchorPoint=Vector2.new(1,0.5); cooldownLabel.ZIndex=53; cooldownLabel.Parent=entry
+		actionButton.BackgroundColor3=Color3.fromRGB(50,50,60); actionButton.Text="⏳"; actionButton.Active=false
+	end
+
+	local baseColor = actionButton.BackgroundColor3
+	actionButton.MouseEnter:Connect(function()
+		if cooldownRemaining <= 0 then
+			createSmoothTween(actionButton, {BackgroundColor3=isPlayerMuted(targetPlayer) and Color3.fromRGB(90,110,130) or Color3.fromRGB(80,90,110), BackgroundTransparency=0.05, TextSize=14}, 0.15)
+		end
+	end)
+	actionButton.MouseLeave:Connect(function()
+		createSmoothTween(actionButton, {BackgroundColor3=baseColor, BackgroundTransparency=0.1, TextSize=13}, 0.15)
+	end)
+
+	actionButton.MouseButton1Click:Connect(function()
+		local remaining = getCooldownRemaining(targetPlayer)
+		if remaining > 0 then addSystem("⏳ Wait "..math.ceil(remaining).."s to mute "..targetPlayer.Name); return end
+
+		if isPlayerMuted(targetPlayer) then
+			mutedPlayers[targetPlayer] = nil; muteCooldowns[targetPlayer] = os.time() + 60
+			actionButton.Text="Mute"; actionButton.BackgroundColor3=Color3.fromRGB(60,70,90); baseColor=actionButton.BackgroundColor3
+			createSmoothTween(entry, {BackgroundColor3=Color3.fromRGB(50,80,50)}, 0.15, nil, nil, function() createSmoothTween(entry, {BackgroundColor3=Color3.fromRGB(35,37,43)}, 0.2) end)
+			addSystem("✅ Unmuted "..targetPlayer.Name); sendMuteNotification(targetPlayer, false)
+		else
+			mutedPlayers[targetPlayer]={player=targetPlayer, muteTime=os.time()}; muteCooldowns[targetPlayer]=os.time()+60
+			actionButton.Text="Unmute"; actionButton.BackgroundColor3=Color3.fromRGB(70,90,110); baseColor=actionButton.BackgroundColor3
+
+			do
+				local mutedIcon = Instance.new("TextLabel")
+				mutedIcon.BackgroundTransparency=1; mutedIcon.Text="🔇"; mutedIcon.Font=Enum.Font.GothamBold
+				mutedIcon.TextSize=18; mutedIcon.TextColor3=Color3.fromRGB(255,100,100)
+				mutedIcon.Size=UDim2.new(0,30,0,30); mutedIcon.Position=UDim2.new(0,8,0.5,0)
+				mutedIcon.AnchorPoint=Vector2.new(0,0.5); mutedIcon.ZIndex=54; mutedIcon.TextTransparency=1; mutedIcon.Parent=entry
+				createSmoothTween(mutedIcon, {TextTransparency=0, TextSize=24}, 0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out, function()
+					createSmoothTween(mutedIcon, {TextSize=18}, 0.15)
+					task.delay(2, function()
+						if mutedIcon and mutedIcon.Parent then createSmoothTween(mutedIcon, {TextTransparency=1}, 0.3) end
+					end)
+				end)
+			end
+
+			createSmoothTween(entry, {BackgroundColor3=Color3.fromRGB(80,50,50)}, 0.15, nil, nil, function() createSmoothTween(entry, {BackgroundColor3=Color3.fromRGB(35,37,43)}, 0.2) end)
+			addSystem("🔇 Muted "..targetPlayer.Name); sendMuteNotification(targetPlayer, true)
+		end
+
+		local oldCL = entry:FindFirstChild("CooldownLabel")
+		if oldCL then oldCL:Destroy() end
+		local newCooldownLabel = Instance.new("TextLabel")
+		newCooldownLabel.Name="CooldownLabel"; newCooldownLabel.BackgroundTransparency=1
+		newCooldownLabel.Text="⏳60s"; newCooldownLabel.Font=Enum.Font.Gotham; newCooldownLabel.TextSize=11
+		newCooldownLabel.TextColor3=Color3.fromRGB(180,180,180); newCooldownLabel.Size=UDim2.new(0,50,0,20)
+		newCooldownLabel.Position=UDim2.new(1,-100,0.5,0); newCooldownLabel.AnchorPoint=Vector2.new(1,0.5)
+		newCooldownLabel.ZIndex=53; newCooldownLabel.Parent=entry
+		actionButton.BackgroundColor3=Color3.fromRGB(50,50,60); actionButton.Text="⏳"; actionButton.Active=false
+
+		coroutine.wrap(function()
+			while muteCooldowns[targetPlayer] and os.time() < muteCooldowns[targetPlayer] do
+				local rem = muteCooldowns[targetPlayer] - os.time()
+				if rem > 0 and newCooldownLabel and newCooldownLabel.Parent then
+					newCooldownLabel.Text = "⏳"..math.ceil(rem).."s"
+				end
+				task.wait(0.5)
+			end
+			if newCooldownLabel and newCooldownLabel.Parent then newCooldownLabel:Destroy() end
+			if actionButton and actionButton.Parent then
+				actionButton.BackgroundColor3=isPlayerMuted(targetPlayer) and Color3.fromRGB(70,90,110) or Color3.fromRGB(60,70,90)
+				actionButton.Text=isPlayerMuted(targetPlayer) and "Unmute" or "Mute"
+				actionButton.Active=true; baseColor=actionButton.BackgroundColor3
+			end
+			muteCooldowns[targetPlayer] = nil
+		end)()
+	end)
+end
+
+--------------------------------------------------------------------
+-- BLOCK WHISPER TO MUTED + RECEIVE MUTE EVENTS
+--------------------------------------------------------------------
+local originalSendMessage = sendMessage
+sendMessage = function(msg)
+	msg = string.gsub(msg, "^%s+", "")
+	msg = string.gsub(msg, "%s+$", "")
+	if msg == "" then return end
+	if whisperTargetPlayer and isPlayerMuted(whisperTargetPlayer) then
+		addSystem("🔇 " .. whisperTargetPlayer.Name .. " is muted"); return
+	end
+	originalSendMessage(msg)
+end
+
+local MuteEvent = ReplicatedStorage:WaitForChild("MuteEvent", 10)
+if MuteEvent then
+	MuteEvent.OnClientEvent:Connect(function(action, fromPlayer)
+		if not fromPlayer or not fromPlayer:IsA("Player") then return end
+		if action == "muted_by" then
+			mutedByOthers[fromPlayer] = true
+			addSystem("🔇 " .. fromPlayer.Name .. " has muted you.")
+		elseif action == "unmuted_by" then
+			mutedByOthers[fromPlayer] = nil
+			addSystem("🔊 " .. fromPlayer.Name .. " unmuted you.")
+		elseif action == "you_muted" then
+			mutedPlayers[fromPlayer] = {player = fromPlayer, muteTime = os.time()}
+			if fromPlayer and fromPlayer.Parent then
+				addSystem("🔇 " .. fromPlayer.Name .. " is still muted.")
+			end
+		end
+	end)
+end
+
+task.spawn(function()
+	while true do
+		task.wait(30)
+		local currentTime = os.time()
+		for player, cooldownEnd in pairs(muteCooldowns) do
+			if currentTime >= cooldownEnd then muteCooldowns[player] = nil end
+		end
+	end
+end)
+
+print("SafetyChatClient: Premium Mute System Loaded - FULLY FIXED")
+print("SafetyChatClient: Initialization complete!")
+print("=== FINAL STATUS ===")
+print("ScreenGui exists:", screenGui ~= nil)
+print("ScreenGui parent:", screenGui.Parent)
+print("ScreenGui enabled:", screenGui.Enabled)
+print("ChatFrame exists:", chatFrame ~= nil)
+print("ChatFrame visible:", chatFrame.Visible)
+print("ChatFrame parent:", chatFrame.Parent)
+print("Team Chat Button visible:", chatModeButton.Visible)

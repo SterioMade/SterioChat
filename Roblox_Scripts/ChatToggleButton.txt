@@ -1,0 +1,95 @@
+-- ChatTopbarInline.client.lua
+-- Pixel-accurate Roblox-style spacing + slightly smaller icon
+
+local Players = game:GetService("Players")
+local GuiService = game:GetService("GuiService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local BUTTON_NAME = "ChatToggleButton"
+
+-- Roblox top bar metrics
+local TOPBAR_ICON_SIZE = 44
+local TOPBAR_GAP = 8
+local LEFT_PADDING = 12
+
+-- Visual tuning (THIS is what you asked for)
+local ICON_SCALE = 0.8          -- 🔽 slightly smaller than Roblox
+local EXTRA_MENU_SPACING = 14     -- ➕ more breathing room
+
+-- Bottom alignment tuning (leave as-is)
+local ROBLOX_BOTTOM_OFFSET = 46.65
+
+local function findButton()
+	for _, gui in ipairs(playerGui:GetChildren()) do
+		if gui:IsA("ScreenGui") then
+			local btn = gui:FindFirstChild(BUTTON_NAME, true)
+			if btn and btn:IsA("GuiObject") then
+				return btn
+			end
+		end
+	end
+end
+
+local function applyScaleOnce(btn)
+	if btn:GetAttribute("ScaledForTopbar") then return end
+	btn:SetAttribute("ScaledForTopbar", true)
+
+	local size = btn.Size
+	btn.Size = UDim2.fromOffset(
+		math.floor(size.X.Offset * ICON_SCALE + 0.5),
+		math.floor(size.Y.Offset * ICON_SCALE + 0.5)
+	)
+end
+
+local function positionInline(btn)
+	if not btn then return end
+
+	applyScaleOnce(btn)
+
+	local inset = GuiService:GetGuiInset()
+
+	-- X: after Roblox + Menu buttons, with extra spacing
+	local x =
+		LEFT_PADDING +
+		(TOPBAR_ICON_SIZE * 2) +
+		(TOPBAR_GAP * 2) +
+		EXTRA_MENU_SPACING
+
+	-- Y: bottom-aligned with Roblox icons (do NOT touch)
+	local y =
+		inset.Y +
+		TOPBAR_ICON_SIZE -
+		btn.AbsoluteSize.Y -
+		ROBLOX_BOTTOM_OFFSET
+
+	btn.AnchorPoint = Vector2.new(0, 0)
+	btn.Position = UDim2.fromOffset(
+		math.floor(x + 0.5),
+		math.floor(y + 0.5)
+	)
+end
+
+task.spawn(function()
+	local button
+	repeat
+		button = findButton()
+		RunService.Heartbeat:Wait()
+	until button
+
+	positionInline(button)
+
+	GuiService:GetPropertyChangedSignal("TopbarInset"):Connect(function()
+		positionInline(button)
+	end)
+
+	playerGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		positionInline(button)
+	end)
+
+	button:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		positionInline(button)
+	end)
+end)

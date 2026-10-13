@@ -1,0 +1,287 @@
+-- DisclaimerScript (LocalScript inside StarterGui > DisclaimerGui)
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local screenGui = script.Parent
+
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+humanoid.WalkSpeed = 0
+humanoid.JumpPower = 0
+
+local function enableControls()
+	humanoid.WalkSpeed = 16
+	humanoid.JumpPower = 50
+end
+
+-- ══════════════════════════════════════════
+--  SETTINGS
+-- ══════════════════════════════════════════
+local ACCENT_COLOR   = Color3.fromRGB(255, 80, 60)
+local BG_PANEL       = Color3.fromRGB(20, 20, 30)
+local BORDER_COLOR   = Color3.fromRGB(255, 80, 60)
+local TEXT_PRIMARY   = Color3.fromRGB(240, 240, 255)
+local TEXT_MUTED     = Color3.fromRGB(160, 160, 190)
+local TWEEN_DURATION = 0.45
+
+-- ══════════════════════════════════════════
+--  RESPONSIVE SIZE HELPER
+--  Reads the actual viewport each time
+--  so it works on any device/resolution.
+-- ══════════════════════════════════════════
+local camera = workspace.CurrentCamera
+
+local function getResponsiveSize()
+	local vp = camera.ViewportSize
+	local sw, sh = vp.X, vp.Y
+
+	-- Panel takes up 88% of screen width, capped between 300px and 680px.
+	-- Height is locked to a 68:50 aspect ratio of the chosen width.
+	local panelW = math.clamp(sw * 0.65, 220, 500)
+	local panelH = math.clamp(panelW * (500 / 680), 220, 500)
+
+	-- Scale all font sizes relative to panel width
+	-- 680px panel = 100% scale, smaller panels shrink fonts proportionally
+	local scale = panelW / 680
+
+	return panelW, panelH, scale
+end
+
+-- ══════════════════════════════════════════
+--  SCREEN GUI SETUP
+-- ══════════════════════════════════════════
+screenGui.IgnoreGuiInset = true
+screenGui.ResetOnSpawn   = false
+screenGui.DisplayOrder   = 9999
+
+-- ══════════════════════════════════════════
+--  OVERLAY
+-- ══════════════════════════════════════════
+local overlay = Instance.new("TextButton")
+overlay.Name                   = "Overlay"
+overlay.Size                   = UDim2.new(1, 0, 1, 0)
+overlay.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
+overlay.BackgroundTransparency = 1
+overlay.ZIndex                 = 10
+overlay.Text                   = ""
+overlay.AutoButtonColor        = false
+overlay.Parent                 = screenGui
+
+-- ══════════════════════════════════════════
+--  MAIN PANEL
+-- ══════════════════════════════════════════
+local panelW, panelH, scale = getResponsiveSize()
+
+local panel = Instance.new("Frame")
+panel.Name             = "Panel"
+panel.AnchorPoint      = Vector2.new(0.5, 0.5)
+panel.Position         = UDim2.new(0.5, 0, 0.5, 0)
+panel.Size             = UDim2.new(0, 0, 0, 0)           -- starts at 0 for pop-in
+panel.BackgroundColor3 = BG_PANEL
+panel.BorderSizePixel  = 0
+panel.ZIndex           = 11
+panel.ClipsDescendants = true
+panel.Parent           = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 16)
+corner.Parent = panel
+
+local stroke = Instance.new("UIStroke")
+stroke.Color        = BORDER_COLOR
+stroke.Thickness    = 2
+stroke.Transparency = 0.2
+stroke.Parent       = panel
+
+-- ══════════════════════════════════════════
+--  WARNING ICON
+-- ══════════════════════════════════════════
+local iconLabel = Instance.new("TextLabel")
+iconLabel.Name                   = "Icon"
+iconLabel.AnchorPoint            = Vector2.new(0.5, 0)
+iconLabel.Position               = UDim2.new(0.5, 0, 0, math.round(32 * scale))
+iconLabel.Size                   = UDim2.new(0, math.round(70 * scale), 0, math.round(70 * scale))
+iconLabel.BackgroundColor3       = Color3.fromRGB(255, 80, 40)
+iconLabel.BackgroundTransparency = 0.85
+iconLabel.Text                   = "⚠"
+iconLabel.TextColor3             = ACCENT_COLOR
+iconLabel.TextSize               = math.round(42 * scale)
+iconLabel.Font                   = Enum.Font.GothamBold
+iconLabel.ZIndex                 = 12
+iconLabel.Parent                 = panel
+
+local iconCorner = Instance.new("UICorner")
+iconCorner.CornerRadius = UDim.new(1, 0)
+iconCorner.Parent = iconLabel
+
+-- ══════════════════════════════════════════
+--  TITLE
+-- ══════════════════════════════════════════
+local title = Instance.new("TextLabel")
+title.Name                   = "Title"
+title.AnchorPoint            = Vector2.new(0.5, 0)
+title.Position               = UDim2.new(0.5, 0, 0, math.round(118 * scale))
+title.Size                   = UDim2.new(1, math.round(-48 * scale), 0, math.round(34 * scale))
+title.BackgroundTransparency = 1
+title.Text                   = "⚡ CUSTOM CHAT - DISCLAIMER"
+title.TextColor3             = TEXT_PRIMARY
+title.TextSize               = math.round(24 * scale)
+title.Font                   = Enum.Font.GothamBold
+title.TextXAlignment         = Enum.TextXAlignment.Center
+title.ZIndex                 = 12
+title.Parent                 = panel
+
+local underline = Instance.new("Frame")
+underline.AnchorPoint      = Vector2.new(0.5, 0)
+underline.Position         = UDim2.new(0.5, 0, 0, math.round(160 * scale))
+underline.Size             = UDim2.new(0, math.round(260 * scale), 0, 2)
+underline.BackgroundColor3 = ACCENT_COLOR
+underline.BorderSizePixel  = 0
+underline.ZIndex           = 12
+underline.Parent           = panel
+
+local underlineGradient = Instance.new("UIGradient")
+underlineGradient.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 120, 60)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 40,  40)),
+	ColorSequenceKeypoint.new(1,   Color3.fromRGB(255, 120, 60)),
+})
+underlineGradient.Parent = underline
+
+-- ══════════════════════════════════════════
+--  BODY TEXT
+-- ══════════════════════════════════════════
+local body = Instance.new("TextLabel")
+body.Name                   = "Body"
+body.AnchorPoint            = Vector2.new(0.5, 0)
+body.Position               = UDim2.new(0.5, 0, 0, math.round(178 * scale))
+body.Size                   = UDim2.new(1, math.round(-72 * scale), 0, math.round(210 * scale))
+body.BackgroundTransparency = 1
+body.TextWrapped            = true
+body.RichText               = true
+body.Text                   = [[<b><font color="rgb(255,100,80)">This custom chat does NOT fully comply with Roblox's standard chat TOS.</font></b>
+
+This game features a <b>custom global chat system</b> designed to fix Roblox's recent chat update. Unlike Roblox's default chat, <b>no age verification or ID check is required</b> to participate - you can chat freely with players worldwide.
+
+This chat was built with <b>good intentions</b>: to create a <b>safer, stronger</b> chat experience for everyone, without the restrictions of Roblox's age-gating system. Use it responsibly.]]
+body.TextColor3             = TEXT_MUTED
+body.TextSize               = math.round(16 * scale)
+body.Font                   = Enum.Font.Gotham
+body.TextXAlignment         = Enum.TextXAlignment.Center
+body.ZIndex                 = 12
+body.Parent                 = panel
+
+-- ══════════════════════════════════════════
+--  ACKNOWLEDGE BUTTON
+-- ══════════════════════════════════════════
+local ackBtn = Instance.new("TextButton")
+ackBtn.Name             = "AckBtn"
+ackBtn.AnchorPoint      = Vector2.new(0.5, 1)
+ackBtn.Position         = UDim2.new(0.5, 0, 1, math.round(-22 * scale))
+ackBtn.Size             = UDim2.new(0, math.round(280 * scale), 0, math.round(50 * scale))
+ackBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+ackBtn.BorderSizePixel  = 0
+ackBtn.Text             = "I Understand... Enter Chat!"
+ackBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+ackBtn.TextSize         = math.round(16 * scale)
+ackBtn.Font             = Enum.Font.GothamBold
+ackBtn.ZIndex           = 12
+ackBtn.Parent           = panel
+
+local ackBtnCorner = Instance.new("UICorner")
+ackBtnCorner.CornerRadius = UDim.new(0, 10)
+ackBtnCorner.Parent = ackBtn
+
+local ackStroke = Instance.new("UIStroke")
+ackStroke.Color        = ACCENT_COLOR
+ackStroke.Thickness    = 2
+ackStroke.Transparency = 0.1
+ackStroke.Parent       = ackBtn
+
+-- Button hover: scale relative to device size
+local btnNormal = UDim2.new(0, math.round(280 * scale), 0, math.round(50 * scale))
+local btnHover  = UDim2.new(0, math.round(292 * scale), 0, math.round(53 * scale))
+
+ackBtn.MouseEnter:Connect(function()
+	TweenService:Create(ackBtn, TweenInfo.new(0.15), { Size = btnHover }):Play()
+end)
+ackBtn.MouseLeave:Connect(function()
+	TweenService:Create(ackBtn, TweenInfo.new(0.15), { Size = btnNormal }):Play()
+end)
+
+-- ══════════════════════════════════════════
+--  ANIMATION: POP IN
+-- ══════════════════════════════════════════
+panel.BackgroundTransparency = 1
+
+TweenService:Create(overlay, TweenInfo.new(0.3), {
+	BackgroundTransparency = 0.5,
+}):Play()
+
+TweenService:Create(panel, TweenInfo.new(
+	TWEEN_DURATION,
+	Enum.EasingStyle.Back,
+	Enum.EasingDirection.Out
+	), {
+		Size = UDim2.new(0, panelW, 0, panelH),
+		BackgroundTransparency = 0,
+	}):Play()
+
+-- ══════════════════════════════════════════
+--  VIEWPORT RESIZE — re-scales if the
+--  window is resized (PC only, no-op mobile)
+-- ══════════════════════════════════════════
+camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+	local newW, newH, newScale = getResponsiveSize()
+
+	panel.Size = UDim2.new(0, newW, 0, newH)
+
+	iconLabel.Position = UDim2.new(0.5, 0, 0, math.round(32 * newScale))
+	iconLabel.Size     = UDim2.new(0, math.round(70 * newScale), 0, math.round(70 * newScale))
+	iconLabel.TextSize = math.round(42 * newScale)
+
+	title.Position = UDim2.new(0.5, 0, 0, math.round(118 * newScale))
+	title.Size     = UDim2.new(1, math.round(-48 * newScale), 0, math.round(34 * newScale))
+	title.TextSize = math.round(24 * newScale)
+
+	underline.Position = UDim2.new(0.5, 0, 0, math.round(160 * newScale))
+	underline.Size     = UDim2.new(0, math.round(260 * newScale), 0, 2)
+
+	body.Position = UDim2.new(0.5, 0, 0, math.round(178 * newScale))
+	body.Size     = UDim2.new(1, math.round(-72 * newScale), 0, math.round(210 * newScale))
+	body.TextSize = math.round(16 * newScale)
+
+	ackBtn.Position = UDim2.new(0.5, 0, 1, math.round(-22 * newScale))
+	ackBtn.Size     = UDim2.new(0, math.round(280 * newScale), 0, math.round(50 * newScale))
+	ackBtn.TextSize = math.round(16 * newScale)
+end)
+
+-- ══════════════════════════════════════════
+--  CLOSE FUNCTION
+-- ══════════════════════════════════════════
+local function closeUI()
+	enableControls()
+
+	local cW, cH = panel.AbsoluteSize.X, panel.AbsoluteSize.Y
+
+	TweenService:Create(panel, TweenInfo.new(
+		0.3,
+		Enum.EasingStyle.Back,
+		Enum.EasingDirection.In
+		), {
+			Size = UDim2.new(0, 0, 0, 0),
+			BackgroundTransparency = 1,
+		}):Play()
+
+	TweenService:Create(overlay, TweenInfo.new(0.3), {
+		BackgroundTransparency = 1,
+	}):Play()
+
+	task.delay(0.35, function()
+		screenGui:Destroy()
+	end)
+end
+
+ackBtn.MouseButton1Click:Connect(closeUI)

@@ -1,0 +1,52 @@
+-- ServerScriptService.MuteHandler
+-- COMPLETE FIX - Just copy and paste this entire file
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Create remote if it doesn't exist
+local muteNotificationEvent = ReplicatedStorage:FindFirstChild("MuteNotificationEvent")
+if not muteNotificationEvent then
+	muteNotificationEvent = Instance.new("RemoteEvent")
+	muteNotificationEvent.Name = "MuteNotificationEvent"
+	muteNotificationEvent.Parent = ReplicatedStorage
+end
+
+-- Store mute status on server
+local playerMutes = {}
+
+-- Handle client mute notifications
+muteNotificationEvent.OnServerEvent:Connect(function(player, targetPlayer, isMute, muterName)
+	if not player or not targetPlayer or not targetPlayer:IsA("Player") then return end
+
+	if not playerMutes[player.UserId] then
+		playerMutes[player.UserId] = {}
+	end
+
+	if isMute then
+		playerMutes[player.UserId][targetPlayer.UserId] = true
+		print("[MUTE]", player.Name, "muted", targetPlayer.Name)
+	else
+		playerMutes[player.UserId][targetPlayer.UserId] = nil
+		print("[MUTE]", player.Name, "unmuted", targetPlayer.Name)
+	end
+
+	-- Send private notification to target player
+	if targetPlayer and targetPlayer.Parent then
+		pcall(function()
+			muteNotificationEvent:FireClient(targetPlayer, isMute, player.Name)
+		end)
+	end
+end)
+
+-- Function to check if a player is muted
+local function isPlayerMuted(muterPlayer, targetPlayer)
+	if not muterPlayer or not targetPlayer then return false end
+	if not playerMutes[muterPlayer.UserId] then return false end
+	return playerMutes[muterPlayer.UserId][targetPlayer.UserId] == true
+end
+
+-- Make it globally accessible
+_G.isPlayerMuted = isPlayerMuted
+
+print("✅ MuteHandler loaded - FIXED")
