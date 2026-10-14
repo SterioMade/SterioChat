@@ -1791,13 +1791,94 @@ end
 
 -- Targeted moderation regression fixes (Oct 2026)
 -- Run these before broad checks so the reported reason is accurate.
+-- Shared priority rule for the latest self-harm moderation reports.
+-- Only the exact explicitly in-game example is exempted here.
+local function checkSelfHarmPriority(message)
+	local compact = tostring(message or ""):lower()
+		:gsub("0", "o"):gsub("1", "i"):gsub("3", "e")
+		:gsub("4", "a"):gsub("5", "s"):gsub("7", "t")
+		:gsub("[^a-z]", "")
+	local normalized = compact:gsub("(.)%1+", "%1")
+
+	if compact == "eliminateurselfingame" or compact == "eliminateyourselfingame" then
+		return false, nil, true -- explicit Roblox/gameplay context
+	end
+
+	-- Direct self-harm encouragement with separators and number substitutions.
+	for _, verb in ipairs({"kil", "eliminate"}) do
+		for _, target in ipairs({"urself", "yourself", "yoself", "uself"}) do
+			if normalized:find(verb .. target, 1, true) then
+				return true, "self_harm", false
+			end
+		end
+	end
+
+	-- Roblox 'reset character' euphemism becomes unsafe when aimed at IRL.
+	if (normalized:find("reseturcharirl", 1, true)
+		or normalized:find("resetyourcharirl", 1, true)
+		or normalized:find("reseturcharacterirl", 1, true)
+		or normalized:find("resetyourcharacterirl", 1, true)) then
+		return true, "self_harm", false
+	end
+
+	return false, nil, false
+end
+
+-- Targeted game-directed insults. Keep ordinary references to trash/garbage allowed.
+local function checkDirectedGameInsult(message)
+	local compact = tostring(message or ""):lower()
+		:gsub("0", "o"):gsub("1", "i"):gsub("3", "e")
+		:gsub("4", "a"):gsub("5", "s"):gsub("7", "t")
+		:gsub("[^a-z]", "")
+	local targets = {
+		"ur", "your", "youre", "youare", "uare", "you", "u",
+	}
+	local insults = {"trash", "garbage"}
+	local gameContext = {
+		"atthisgame", "atgame", "atthegame", "atplaying",
+		"inthisgame", "inroblox", "atroblox", "player",
+	}
+	for _, target in ipairs(targets) do
+		for _, insult in ipairs(insults) do
+			local phrase = target .. insult
+			if compact == phrase then
+				return true, "harassment"
+			end
+			for _, context in ipairs(gameContext) do
+				if compact:find(phrase .. context, 1, true)
+					or compact:find(target .. "so" .. insult .. context, 1, true) then
+					return true, "harassment"
+				end
+			end
+		end
+	end
+	return false, nil
+end
+
 local function checkReportedBypasses(message)
+	local priorityBlocked, priorityReason, priorityAllowed = checkSelfHarmPriority(message)
+	if priorityBlocked then return true, priorityReason end
+	if priorityAllowed then return false, nil end
 	local raw = tostring(message or ""):lower()
 	local compact = raw
 		:gsub("0", "o"):gsub("1", "i"):gsub("3", "e")
 		:gsub("4", "a"):gsub("5", "s"):gsub("7", "t")
 		:gsub("@", "a"):gsub("!", "i")
 		:gsub("[^a-z]", "")
+
+	-- Direct encouragement to harm oneself: classify before generic profanity.
+	-- The compact form removes separators and decodes common number substitutions.
+	-- Collapse repeated letters only for this check (e.g. ursel/ff -> urself).
+	local directed = compact:gsub("(.)%1+", "%1")
+	local selfTargets = {"urself", "yourself", "yoself", "uself"}
+	local harmVerbs = {"kil", "eliminate"}
+	for _, verb in ipairs(harmVerbs) do
+		for _, target in ipairs(selfTargets) do
+			if directed:find(verb .. target, 1, true) then
+				return true, "self_harm"
+			end
+		end
+	end
 
 	-- Specific categories must take precedence over generic profanity/sexual flags.
 	if compact:find("freerobux", 1, true)
@@ -1932,6 +2013,11 @@ local function checkReportedBypasses(message)
 end
 
 local function isToxic(msg)
+	local insultBlocked, insultReason = checkDirectedGameInsult(msg)
+	if insultBlocked then return true, insultReason end
+	local priorityBlocked, priorityReason, priorityAllowed = checkSelfHarmPriority(msg)
+	if priorityBlocked then return true, priorityReason end
+	if priorityAllowed then return false, nil end
 
 	local regressionBlocked, regressionReason = checkReportedBypasses(msg)
 	if regressionBlocked then
@@ -4919,6 +5005,11 @@ local function containsAcrosticInstruction(msg)
 end
 
 local function shouldBlock(sender, rawMessage)
+	local insultBlocked, insultReason = checkDirectedGameInsult(rawMessage)
+	if insultBlocked then return true, insultReason end
+	local priorityBlocked, priorityReason, priorityAllowed = checkSelfHarmPriority(rawMessage)
+	if priorityBlocked then return true, priorityReason end
+	if priorityAllowed then return false, nil end
 	-- Exact in-game location response: not an off-platform or unsafe phrase.
 	-- Other messages still pass through the full existing moderation pipeline.
 	if rawMessage:lower():gsub("[^a-z0-9]", " ")
@@ -5460,6 +5551,11 @@ local ALLOWED_STICKERS = {
 ChatEvent.OnServerEvent:Connect(function(player, message, whisperTarget)
 	if typeof(message) ~= "string" then return end
 	local blocked, reason = isToxic(message)
+	-- Preserve self-harm classification if generic filtering also recognizes profanity.
+	if blocked then
+		local selfHarmHit = checkSelfHarmPriority(message)
+		if selfHarmHit then reason = "self_harm" end
+	end
 
 	if blocked then
 		logModeration(player, message, reason or "harassment", "BLOCKED")
@@ -5644,6 +5740,15 @@ ChatEvent.OnServerEvent:Connect(function(player, message, whisperTarget)
 
 	local shouldBlockMessage, blockReasonCheck = shouldBlock(player, message)
 
+	-- Final reason-priority safeguard: don't label directed self-harm as profanity.
+	-- This is deliberately limited to messages already classified as blocked.
+	if shouldBlockMessage then
+		local selfHarmHit = checkSelfHarmPriority(message)
+		if selfHarmHit then
+			blockReasonCheck = "self_harm"
+		end
+	end
+
 	if shouldBlockMessage then
 		warn("[CHAT DEBUG] Blocked message:",
 			message,
@@ -5682,7 +5787,9 @@ ChatEvent.OnServerEvent:Connect(function(player, message, whisperTarget)
 		end
 
 		local displayReason
-		if blockReasonCheck == "scam" then
+		if blockReasonCheck == "self_harm" then
+			displayReason = "encouraging self-harm"
+		elseif blockReasonCheck == "scam" then
 			displayReason = "scam or fake reward"
 		elseif blockReasonCheck == "cringe" then
 			displayReason = "message not appropriate for this chat"
