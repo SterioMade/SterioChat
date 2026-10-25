@@ -1855,6 +1855,199 @@ local function checkDirectedGameInsult(message)
 	return false, nil
 end
 
+-- ===== COUNTRY / NATIONALITY SUPPORT =====
+local COUNTRY_WORDS = {}
+for _, w in ipairs({
+	"nigerian","nigeria","american","america","british","england","english","canadian","canada",
+	"mexican","mexico","brazilian","brazil","argentinian","argentina","colombian","colombia",
+	"chilean","chile","peruvian","peru","venezuelan","venezuela","cuban","cuba","jamaican","jamaica",
+	"haitian","haiti","french","france","german","germany","italian","italy","spanish","spain",
+	"portuguese","portugal","dutch","netherlands","belgian","belgium","swiss","switzerland",
+	"austrian","austria","irish","ireland","scottish","scotland","welsh","wales",
+	"swedish","sweden","norwegian","norway","danish","denmark","finnish","finland",
+	"polish","poland","russian","russia","ukrainian","ukraine","greek","greece",
+	"turkish","turkey","romanian","romania","hungarian","hungary","czech","serbian","serbia",
+	"croatian","croatia","bulgarian","bulgaria","indian","india","pakistani","pakistan",
+	"bangladeshi","bangladesh","chinese","china","japanese","japan","korean","korea",
+	"vietnamese","vietnam","thai","thailand","filipino","philippines","indonesian","indonesia",
+	"malaysian","malaysia","singaporean","singapore","australian","australia","kiwi",
+	"egyptian","egypt","moroccan","morocco","algerian","algeria","tunisian","tunisia",
+	"ghanaian","ghana","kenyan","kenya","ethiopian","ethiopia","somali","somalia",
+	"ugandan","uganda","tanzanian","tanzania","zimbabwean","zimbabwe","sudanese","sudan",
+	"south african","south africa","saudi","saudi arabia","emirati","uae","iranian","iran",
+	"iraqi","iraq","israeli","israel","lebanese","lebanon","syrian","syria","jordanian",
+	"afghan","afghanistan","nepali","nepal","sri lankan","sri lanka",
+	"united states","usa","united kingdom","uk","new zealand","south korea","north korea",
+	"puerto rico","costa rica","dominican republic","hong kong","taiwan","taiwanese",
+	}) do COUNTRY_WORDS[w] = true end
+
+-- Replaces whole-word country names with a space so short profanity roots
+-- (like "nig") can't match inside them. Whole words only: "niger" is NOT
+-- in the list, and split-up spellings like "ni gerian" are not stripped.
+local function stripCountryWords(text)
+	text = tostring(text or ""):lower()
+	for w, _ in pairs(COUNTRY_WORDS) do
+		text = text:gsub("%f[%a]" .. w .. "%f[%A]", " ")
+	end
+	return text
+end
+
+-- True ONLY for harmless country-level statements, e.g.
+-- "i am from nigeria", "i live in nigeria", "im nigerian", "are you from india?"
+local COUNTRY_PREFIXES = {
+	"i am from","i m from","im from","i come from","i came from",
+	"i am living in","i m living in","im living in","i live in","i lived in",
+	"i was born in","i am born in","born in","live in","living in",
+	"my country is","my family is from","my parents are from",
+	"we are from","we re from","from",
+	"i am a","i m a","im a","i am an","i m an","im an","i am","i m","im",
+	"are you from","are u from","r u from","u from","you from",
+	"are you","are u","r u","do you live in","do u live in",
+}
+local COUNTRY_FILLERS = {" lol"," lmao"," haha"," btw"," too"," tho"," fr"," ngl"," bro"," bruh"," man"," dude"," also"}
+
+local function isCountryStatement(message)
+	local t = tostring(message or ""):lower()
+	t = t:gsub("%p", " "):gsub("%s+", " ")
+	t = t:match("^%s*(.-)%s*$") or ""
+	if t == "" then return false end
+
+	for _ = 1, 2 do
+		for _, f in ipairs(COUNTRY_FILLERS) do
+			if #t > #f and t:sub(-#f) == f then t = t:sub(1, #t - #f) end
+		end
+	end
+
+	if COUNTRY_WORDS[t] then return true end
+
+	for _, p in ipairs(COUNTRY_PREFIXES) do
+		if t:sub(1, #p + 1) == p .. " " then
+			local rest = t:sub(#p + 2)
+			rest = rest:gsub("^the ", "")
+			if COUNTRY_WORDS[rest] then return true end
+		end
+	end
+	return false
+end
+-- ===== END COUNTRY SUPPORT =====
+
+-- ===== THIRD-PARTY / DISGUISED LOCATION SHARING =====
+-- Blocks: "my friend lives in texas", "he livesin 12 oak street", "she lives at ..."
+-- Allows: country-level only ("my friend lives in nigeria"), in-game talk, "going live in 5 min"
+local LOCATION_SAFE_REST = {
+	["game"]=true, ["the game"]=true, ["this game"]=true, ["roblox"]=true,
+	["server"]=true, ["the server"]=true, ["this server"]=true,
+	["the map"]=true, ["this map"]=true, ["map"]=true,
+	["spawn"]=true, ["lobby"]=true, ["the lobby"]=true,
+}
+local LOCATION_TRAILING = {
+	"lol","lmao","haha","btw","too","tho","fr","ngl","bro","bruh","man","dude","also","rn","now",
+}
+local STREET_WORDS = { "street","st","rd","road","avenue","ave","blvd","boulevard","drive" }
+local TIME_UNITS = {
+	["sec"]=true, ["secs"]=true, ["second"]=true, ["seconds"]=true,
+	["min"]=true, ["mins"]=true, ["minute"]=true, ["minutes"]=true,
+	["hour"]=true, ["hours"]=true, ["day"]=true, ["days"]=true,
+}
+local LIVE_PATTERNS = {
+	"%f[%a]lives%s*in%f[%A]%s*(.*)$",
+	"%f[%a]lives%s*at%f[%A]%s*(.*)$",
+	"%f[%a]lives%s*on%f[%A]%s*(.*)$",
+	"%f[%a]live%s*in%f[%A]%s*(.*)$",
+	"%f[%a]live%s*at%f[%A]%s*(.*)$",
+	"%f[%a]living%s*in%f[%A]%s*(.*)$",
+	"%f[%a]living%s*at%f[%A]%s*(.*)$",
+	"%f[%a]lived%s*in%f[%A]%s*(.*)$",
+	"%f[%a]lived%s*at%f[%A]%s*(.*)$",
+	"%f[%a]resides%s*in%f[%A]%s*(.*)$",
+	"%f[%a]resides%s*at%f[%A]%s*(.*)$",
+}
+
+local function checkLocationSharing(message)
+	local t = tostring(message or ""):lower()
+	t = t:gsub("[^%w%s]", " "):gsub("%s+", " ")
+	t = t:match("^%s*(.-)%s*$") or ""
+	if t == "" then return false, nil end
+
+	-- 1) Street-style address anywhere in the message (street word + a number)
+	if t:find("%d") then
+		local padded = " " .. t .. " "
+		for _, w in ipairs(STREET_WORDS) do
+			if padded:find(" " .. w .. " ", 1, true) then
+				return true, "pii_address_pattern"
+			end
+		end
+	end
+
+	-- 2) "<someone> lives in/at/on <anything that isn't a country or the game>"
+	for _, p in ipairs(LIVE_PATTERNS) do
+		local rest = t:match(p)
+		if rest ~= nil then
+			for _ = 1, 2 do
+				for _, f in ipairs(LOCATION_TRAILING) do
+					local suffix = " " .. f
+					if #rest > #suffix and rest:sub(-#suffix) == suffix then
+						rest = rest:sub(1, #rest - #suffix)
+					end
+				end
+			end
+
+			local noThe = (rest:gsub("^the ", ""))
+			local timeUnit = rest:match("^%d+%s+(%a+)")
+
+			local harmless =
+				rest == ""
+				or LOCATION_SAFE_REST[rest]
+				or COUNTRY_WORDS[rest]
+				or COUNTRY_WORDS[noThe]
+				or (timeUnit and TIME_UNITS[timeUnit])
+
+			if not harmless then
+				return true, "pii_address_phrase"
+			end
+		end
+	end
+
+	return false, nil
+end
+-- ===== END LOCATION SHARING =====
+
+-- Detects "ur a nigerian" / "your a nigeria" style disguised n-word insults.
+-- Only fires when it's DIRECTED at someone (pronoun + optional "a/an" + nigeria/nigerian)
+-- and sits at the END of the message (optionally followed by a filler word),
+-- so "my nigerian friend" or "nigeria is a country" are not affected.
+local function checkNigerianInsult(message)
+	local compact = tostring(message or ""):lower()
+		:gsub("|", "i"):gsub("!", "i"):gsub("@", "a")
+		:gsub("0", "o"):gsub("1", "i"):gsub("3", "e")
+		:gsub("4", "a"):gsub("5", "s"):gsub("7", "t")
+		:gsub("[^a-z]", "")
+	compact = collapseRuns(compact) -- "niggerian" -> "nigerian", "urrr" -> "ur"
+
+	local prefixes = {
+		"ur", "your", "youre", "youare", "you", "uare", "ure", "uar", "yur",
+	}
+	local mids = { "", "a", "an", "soa", "such" }
+	local suffixes = { "nigerian", "nigeria", "nigerians", "nigerien", "nigerain" }
+	local fillers = { "", "lol", "lmao", "haha", "bro", "bruh", "man", "dude", "fr", "ngl" }
+
+	for _, pre in ipairs(prefixes) do
+		for _, mid in ipairs(mids) do
+			for _, suf in ipairs(suffixes) do
+				for _, fill in ipairs(fillers) do
+					local phrase = pre .. mid .. suf .. fill
+					-- must be at the end of the message
+					if #compact >= #phrase and compact:sub(-#phrase) == phrase then
+						return true, "profanity"
+					end
+				end
+			end
+		end
+	end
+
+	return false, nil
+end
+
 local function checkReportedBypasses(message)
 	local priorityBlocked, priorityReason, priorityAllowed = checkSelfHarmPriority(message)
 	if priorityBlocked then return true, priorityReason end
@@ -2013,6 +2206,11 @@ local function checkReportedBypasses(message)
 end
 
 local function isToxic(msg)
+	local nigBlocked, nigReason = checkNigerianInsult(msg)
+	if nigBlocked then return true, nigReason end
+	local locBlocked, locReason = checkLocationSharing(msg)
+	if locBlocked then return true, locReason end
+	if isCountryStatement(rawMessage) then return false, nil end
 	local insultBlocked, insultReason = checkDirectedGameInsult(msg)
 	if insultBlocked then return true, insultReason end
 	local priorityBlocked, priorityReason, priorityAllowed = checkSelfHarmPriority(msg)
@@ -3794,6 +3992,8 @@ local function checkSplitWords(player, currentMessage)
 
 
 	local combined = tostring(currentMessage):lower()
+	
+	combined = stripCountryWords(combined)
 
 
 	if combined:match("%f[%a]meeting%f[%A]")
@@ -3899,6 +4099,8 @@ local function hardBlockPII(raw)
 	if raw:match("^rbxassetid://") or raw:match("^rbxsatestid://") then
 		return true, nil
 	end
+	
+	if isCountryStatement(raw) then return true, nil end
 
 	local lower = string.lower(raw)
 	if isContentCreationPhrase(lower) then
@@ -3992,6 +4194,11 @@ local function hardBlockPII(raw)
 	do
 		local nameWord = trimmed:match("i[%s']*m%s+([%a]+)") or trimmed:match("i%s+am%s+([%a]+)")
 		if nameWord then
+			if COUNTRY_WORDS[nameWord]
+				and (trimmed:match("^i[%s']*m%s+%a+[%p%s]*$") or trimmed:match("^i%s+am%s+%a+[%p%s]*$")) then
+				return true, nil
+			end
+			
 			if BENIGN_RAPE_WORDS_EXACT[nameWord] then
 				return true, nil
 			end
@@ -4253,6 +4460,7 @@ local function isNormalGameNumberSentence(text)
 end
 
 local function analyseMessage(raw)
+	raw = stripCountryWords(raw)
 	if containsG00nVariant(raw) then
 		return true, {"sexual_content"}
 	end
@@ -5005,6 +5213,11 @@ local function containsAcrosticInstruction(msg)
 end
 
 local function shouldBlock(sender, rawMessage)
+	local nigBlocked, nigReason = checkNigerianInsult(rawMessage)
+	if nigBlocked then return true, nigReason end
+	local locBlocked, locReason = checkLocationSharing(rawMessage)
+	if locBlocked then return true, locReason end 
+	if isCountryStatement(msg) then return false, nil end
 	local insultBlocked, insultReason = checkDirectedGameInsult(rawMessage)
 	if insultBlocked then return true, insultReason end
 	local priorityBlocked, priorityReason, priorityAllowed = checkSelfHarmPriority(rawMessage)
@@ -6012,6 +6225,7 @@ end)
 
 Players.PlayerRemoving:Connect(function(plr)
 	lastMessageTime[plr] = nil
+	lastWhisperTime[plr] = nil 
 	messageHistory[plr] = nil
 	blockedHistory[plr] = nil
 	muteUntil[plr] = nil
