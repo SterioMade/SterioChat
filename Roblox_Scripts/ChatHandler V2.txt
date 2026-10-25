@@ -857,6 +857,7 @@ end
 
 local lastMessageTime = {}
 local messageHistory  = {}
+local lastWhisperTime = {}
 local blockedHistory  = {}
 local muteUntil       = {}
 local spamState       = {}
@@ -2205,7 +2206,239 @@ local function checkReportedBypasses(message)
 	return false, nil
 end
 
+--------------------------------------------------------------------
+-- IMAGE-CASE DETECTION (exact reasons) + DISPLAY REASON MAPPING
+--------------------------------------------------------------------
+local function collapsedSet(list)
+	local s = {}
+	for _, w in ipairs(list) do s[collapseRuns(w)] = true end
+	return s
+end
+
+local IMG_NUMBER_WORDS = {
+	zero = true, one = true, two = true, three = true, four = true,
+	five = true, six = true, seven = true, eight = true, nine = true,
+}
+
+local IMG_AGE_WORDS = {
+	five = true, six = true, seven = true, eight = true, nine = true, ten = true,
+	eleven = true, twelve = true, thirteen = true, fourteen = true, fifteen = true,
+	sixteen = true, seventeen = true, eighteen = true, nineteen = true,
+	twelv = true, tweleve = true, thirten = true, fourten = true, fifteen_ = true,
+}
+local IMG_AGE_SKIP = { only = true, just = true, almost = true, like = true, turning = true, nearly = true }
+local IMG_AGE_TAIL = {
+	years = true, yrs = true, yr = true, year = true, yo = true, old = true,
+	["and"] = true, lol = true, lmao = true, haha = true, btw = true, tho = true,
+	too = true, bro = true, rn = true, ok = true,
+}
+
+local IMG_COLOR_SET = collapsedSet({
+	"blue", "blew", "bluu", "green", "yellow", "purple", "pink", "red", "orange", "black", "white",
+})
+local IMG_APP_SET = collapsedSet({
+	"app", "apps", "application", "platform", "site", "website", "messenger",
+})
+
+local function imgTokens(message)
+	local s = tostring(message or ""):lower():gsub("'", ""):gsub("[^%w]", " ")
+	local t = {}
+	for tok in s:gmatch("%S+") do t[#t + 1] = tok end
+	return t
+end
+
+local function imgLetters(message)
+	local s = tostring(message or ""):lower()
+	s = s:gsub("|", "i"):gsub("!", "i"):gsub("@", "a"):gsub("%$", "s")
+		:gsub("0", "o"):gsub("1", "i"):gsub("3", "e"):gsub("4", "a"):gsub("5", "s"):gsub("7", "t")
+		:gsub("[^a-z]", "")
+	return s
+end
+
+local function imgAgeToken(tok)
+	if IMG_AGE_WORDS[tok] then return true end
+	local n = tonumber(tok:match("^(%d+)$") or tok:match("^(%d+)yo$") or tok:match("^(%d+)yrs?$"))
+	return n ~= nil and n >= 5 and n <= 19
+end
+
+local function imgAgeShare(tokens)
+	for i, tok in ipairs(tokens) do
+		local start
+		if tok == "im" or tok == "iam" then start = i + 1
+		elseif tok == "i" and (tokens[i + 1] == "am" or tokens[i + 1] == "m") then start = i + 2
+		elseif tok == "my" and tokens[i + 1] == "age" and tokens[i + 2] == "is" then start = i + 3 end
+
+		if start then
+			while tokens[start] and IMG_AGE_SKIP[tokens[start]] do start += 1 end
+			local ageTok = tokens[start]
+			if ageTok and imgAgeToken(ageTok) then
+				local nxt = tokens[start + 1]
+				if nxt == nil or IMG_AGE_TAIL[nxt] then return true end
+			end
+		end
+
+		-- "12 yo" / "12 years old"
+		if imgAgeToken(tok) then
+			local n1, n2 = tokens[i + 1], tokens[i + 2]
+			if n1 == "yo" or ((n1 == "years" or n1 == "year" or n1 == "yrs") and n2 == "old") then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function imgPhoneShare(tokens, c)
+	local ctx = c:find("mynum", 1, true) or c:find("myphone", 1, true) or c:find("mycell", 1, true)
+		or c:find("callme", 1, true) or c:find("textme", 1, true) or c:find("mydigits", 1, true)
+	local run, best = 0, 0
+	for _, tok in ipairs(tokens) do
+		if IMG_NUMBER_WORDS[tok] then run += 1
+		elseif tok:match("^%d+$") then run += #tok
+		else run = 0 end
+		if run > best then best = run end
+	end
+	return best >= 7 or (ctx ~= nil and best >= 4)
+end
+
+local function imgColorApp(tokens)
+	for i = 1, #tokens - 1 do
+		if IMG_COLOR_SET[collapseRuns(tokens[i])] and IMG_APP_SET[collapseRuns(tokens[i + 1])] then
+			return true
+		end
+	end
+	return false
+end
+
+local function checkImageCases(message)
+	local tokens = imgTokens(message)
+	local c = imgLetters(message)
+	local cc = collapseRuns(c)
+	local function has(p) return c:find(p, 1, true) ~= nil end
+	local function hasC(p) return cc:find(collapseRuns(p), 1, true) ~= nil end
+
+	-- 1 & 2: encouraging self-harm (separators, leetspeak, "unalive")
+	for _, tok in ipairs(tokens) do
+		if tok == "kys" then return true, "self_harm" end
+	end
+	for _, verb in ipairs({ "kill", "unalive", "unliv", "eliminate" }) do
+		for _, target in ipairs({ "yourself", "urself", "yoself", "uself", "yourselves", "urselves" }) do
+			if hasC(verb .. target) then return true, "self_harm" end
+		end
+	end
+	for _, p in ipairs({ "youdontdeservetolive", "worldwouldbebetterwithoutyou" }) do
+		if hasC(p) then return true, "self_harm" end
+	end
+
+	-- 3: unsafe personal question / secrecy from parents
+	for _, verb in ipairs({ "donttell", "dontevertell", "donottell", "nevertell", "dontlet" }) do
+		if hasC(verb) then
+			for _, who in ipairs({
+				"urparent", "yourparent", "yoparent", "yaparent", "uparent",
+				"urmom", "yourmom", "urmum", "yourmum", "urdad", "yourdad",
+				"urguardian", "yourguardian", "urteacher", "yourteacher",
+				}) do
+				if hasC(who) then return true, "personal_safety" end
+			end
+		end
+	end
+	for _, p in ipairs({
+		"ourlittlesecret", "ourlilsecret", "keepthissecret", "keepitsecret",
+		"keepthisbetweenus", "justbetweenus", "itsoursecret",
+		}) do
+		if hasC(p) then return true, "personal_safety" end
+	end
+
+	-- 4: threatening content ("i know where u live")
+	for _, p in ipairs({
+		"iknowwhereulive", "iknowwhereyoulive", "iknowwhereurlive", "iknowwhereyalive",
+		"iknowwhereuare", "iknowwhereyouare", "iknowwhereurhouse", "iknowwhereyourhouse",
+		"iknowwhereuwork", "iknowwhereyouwork", "iknowwhereugotoschool", "iknowwhereyougotoschool",
+		"iknowwhereuhide", "iknowwhereyouhide",
+		"iknowurlocation", "iknowyourlocation", "iknowuraddress", "iknowyouraddress",
+		"iknowurhouse", "iknowyourhouse", "ifoundurhouse", "ifoundyourhouse",
+		"ifoundwhereulive", "ifoundwhereyoulive",
+		}) do
+		if hasC(p) then return true, "real_life_threat" end
+	end
+
+	-- 5: personal information (phone number spelled with words or digits)
+	if imgPhoneShare(tokens, c) then return true, "pii_phone" end
+
+	-- 6: off-platform contact via color-coded app ("the blue app")
+	if imgColorApp(tokens) then return true, "contact_platform" end
+
+	-- 7: private contact request (asking for pictures)
+	for _, p in ipairs({
+		"sendmeurpic", "sendmeyourpic", "sendmeupic", "sendurpic", "sendyourpic",
+		"sendmeurphoto", "sendmeyourphoto", "sendmeaphotoofyou", "sendmenudes", "sendnudes",
+		"showmeurpic", "showmeyourpic", "showmeurface", "showmeyourface",
+		"sendmeurselfie", "sendmeyourselfie",
+		}) do
+		if hasC(p) then return true, "contact_request" end
+	end
+
+	-- 8: bullying or harassment
+	for _, p in ipairs({
+		"youshoulddisappear", "ushoulddisappear", "youshouldjustdisappear", "ushouldjustdisappear",
+		"nobodywouldmissyou", "nobodywouldmissu", "noonewouldmissyou", "noonewouldmissu",
+		"nobodywillmissyou", "nobodywillmissu", "noonewillmissyou", "noonewillmissu",
+		"nobodycaresaboutyou", "nobodycaresaboutu", "noonecaresaboutyou", "noonecaresaboutu",
+		"nobodyneedsyou", "nobodyneedsu",
+		}) do
+		if hasC(p) then return true, "harassment" end
+	end
+
+	-- 9: private meetup request (skipped when clearly about the game)
+	local gameContext = has("ingame") or has("inthegame") or has("inroblox")
+		or has("inserver") or has("spawn") or has("lobby")
+	if not gameContext then
+		for _, p in ipairs({
+			"meetme", "meetup", "letsmeet", "wannameet", "wanttomeet",
+			"cometomyhouse", "cometomyplace", "comeovertomy", "comeover",
+			"pickyouup", "seeyouatthepark",
+			}) do
+			if has(p) then return true, "contact_request" end
+		end
+	end
+
+	-- 10: age discussion ("im twelve", "i am 12", "12 yo")
+	if imgAgeShare(tokens) then return true, "age_share" end
+
+	return false, nil
+end
+
+-- One place that turns internal reason codes into the text players see
+local function getDisplayReason(reason)
+	reason = tostring(reason or "")
+	if reason == "self_harm" then return "encouraging self-harm"
+	elseif reason == "personal_safety" then return "unsafe personal question"
+	elseif reason == "real_life_threat" or reason == "threat" then return "threatening content"
+	elseif reason == "contact_request" or reason == "meetup_request" then return "private contact or meetup request"
+	elseif reason:find("^harassment") then return "bullying or harassment"
+	elseif reason == "scam" then return "scam or fake reward"
+	elseif reason == "cringe" then return "message not appropriate for this chat"
+	elseif reason == "profanity" or reason:find("^profanity") then return "inappropriate language"
+	elseif reason == "single_letter" or reason == "gibberish_letters" or reason == "alnum_random"
+		or reason == "number_only" or reason == "toxic_spam" or reason == "spam_repeat"
+		or reason == "spam_rate" then
+		return "please don't spam random letters or numbers"
+	elseif reason == "non_english" then return "English only chat"
+	elseif reason == "pii_real_name" then return "personal information (real name)"
+	elseif reason:find("pii_") then return "personal information"
+	elseif reason:find("age_") then return "age discussion"
+	elseif reason == "contact_platform" or reason == "contact_phrase" or reason == "contact_url" then
+		return "off-platform contact"
+	elseif reason == "dating" then return "dating requests"
+	elseif reason == "excessive_repeats" then return "suspicious formatting"
+	elseif reason == "contact_image_url" then return "image sharing"
+	end
+	return "unsafe content"
+end
+
 local function isToxic(msg)
+	local imgBlocked, imgReason = checkImageCases(msg)
+	if imgBlocked then return true, imgReason end
 	local nigBlocked, nigReason = checkNigerianInsult(msg)
 	if nigBlocked then return true, nigReason end
 	local locBlocked, locReason = checkLocationSharing(msg)
@@ -3992,7 +4225,7 @@ local function checkSplitWords(player, currentMessage)
 
 
 	local combined = tostring(currentMessage):lower()
-	
+
 	combined = stripCountryWords(combined)
 
 
@@ -4099,7 +4332,7 @@ local function hardBlockPII(raw)
 	if raw:match("^rbxassetid://") or raw:match("^rbxsatestid://") then
 		return true, nil
 	end
-	
+
 	if isCountryStatement(raw) then return true, nil end
 
 	local lower = string.lower(raw)
@@ -4198,7 +4431,7 @@ local function hardBlockPII(raw)
 				and (trimmed:match("^i[%s']*m%s+%a+[%p%s]*$") or trimmed:match("^i%s+am%s+%a+[%p%s]*$")) then
 				return true, nil
 			end
-			
+
 			if BENIGN_RAPE_WORDS_EXACT[nameWord] then
 				return true, nil
 			end
@@ -5213,6 +5446,8 @@ local function containsAcrosticInstruction(msg)
 end
 
 local function shouldBlock(sender, rawMessage)
+	local imgBlocked, imgReason = checkImageCases(rawMessage)
+	if imgBlocked then return true, imgReason end
 	local nigBlocked, nigReason = checkNigerianInsult(rawMessage)
 	if nigBlocked then return true, nigReason end
 	local locBlocked, locReason = checkLocationSharing(rawMessage)
@@ -5774,7 +6009,7 @@ ChatEvent.OnServerEvent:Connect(function(player, message, whisperTarget)
 		logModeration(player, message, reason or "harassment", "BLOCKED")
 		sendSystemMessage(
 			player,
-			"Your message was adjusted to keep chat safe (" .. (reason or "unsafe content") .. ")."
+			"Your message was adjusted to keep chat safe (" .. getDisplayReason(reason) .. ")."
 		)
 		return
 	end
@@ -5865,7 +6100,7 @@ ChatEvent.OnServerEvent:Connect(function(player, message, whisperTarget)
 		local shouldBlockMessage, blockReason = shouldBlock(player, message)
 		if shouldBlockMessage then
 			logModeration(player, message, blockReason, "BLOCKED_WHISPER")
-			sendSystemMessage(player, "Your whisper was blocked: " .. tostring(blockReason))
+			sendSystemMessage(player, "Your whisper was blocked: " .. getDisplayReason(blockReason))
 			return
 		end
 		messageHistory[player] = messageHistory[player] or {}
@@ -5980,7 +6215,7 @@ ChatEvent.OnServerEvent:Connect(function(player, message, whisperTarget)
 			logModeration(player, message, blockReasonCheck, "BLOCKED_OFF_PLATFORM")
 			sendSystemMessage(
 				player,
-				"Off-platform contact is not allowed in this chat."
+				"Your message was adjusted to keep chat safe (off-platform contact)."
 			)
 			messageHistory[player] = {}
 			blockedHistory[player] = {}
@@ -5999,42 +6234,7 @@ ChatEvent.OnServerEvent:Connect(function(player, message, whisperTarget)
 			return
 		end
 
-		local displayReason
-		if blockReasonCheck == "self_harm" then
-			displayReason = "encouraging self-harm"
-		elseif blockReasonCheck == "scam" then
-			displayReason = "scam or fake reward"
-		elseif blockReasonCheck == "cringe" then
-			displayReason = "message not appropriate for this chat"
-		elseif blockReasonCheck == "profanity" then
-			displayReason = "inappropriate language"
-		elseif blockReasonCheck == "single_letter"
-			or blockReasonCheck == "gibberish_letters"
-			or blockReasonCheck == "alnum_random"
-			or blockReasonCheck == "number_only"
-			or blockReasonCheck == "toxic_spam"
-			or blockReasonCheck == "spam_repeat"
-			or blockReasonCheck == "spam_rate" then
-			displayReason = "please don't spam random letters or numbers"
-		elseif blockReasonCheck == "non_english" then
-			displayReason = "English only chat"
-		elseif blockReasonCheck == "pii_real_name" then
-			displayReason = "personal information (real name)"
-		elseif blockReasonCheck:find("pii_") then
-			displayReason = "personal information"
-		elseif blockReasonCheck:find("age_") then
-			displayReason = "age discussion"
-		elseif blockReasonCheck == "contact_platform" then
-			displayReason = "off-platform contact"
-		elseif blockReasonCheck == "dating" then
-			displayReason = "dating requests"
-		elseif blockReasonCheck == "excessive_repeats" then
-			displayReason = "suspicious formatting"
-		elseif blockReasonCheck == "contact_image_url" then
-			displayReason = "image sharing"
-		else
-			displayReason = "unsafe content"
-		end
+		local displayReason = getDisplayReason(blockReasonCheck)
 
 		sendSystemMessage(
 			player,
