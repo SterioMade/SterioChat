@@ -1492,6 +1492,7 @@ local SEXUAL_ROOTS = {
 	"penis",
 	"semen",
 	"busty",
+	"cok","cokk","cocc","kock",
 }
 
 -- FIX: Added "balls", "lick", "fuek", "ballcleaner" and other bypass variants
@@ -2412,8 +2413,17 @@ end
 local function getDisplayReason(reason)
 	reason = tostring(reason or "")
 	if reason == "self_harm" then return "encouraging self-harm"
+	elseif reason == "sexual_content" then return "sexual or inappropriate content"
+	elseif reason == "extremism" or reason == "extreme_figure" or reason == "extreme" then
+		return "extremist or harmful content"
+	elseif reason == "hate_violence" or reason == "slur" then return "hate speech"
+	elseif reason == "threat" or reason == "explicit_threat" or reason == "real_life_threat" then
+		return "threatening content"
+	elseif reason == "drug_reference" then return "drug references"
+	elseif reason == "encoded_message" or reason == "bypass_instruction" then
+		return "attempting to bypass the chat filter"
+	elseif reason == "foreign_profanity" then return "inappropriate language"
 	elseif reason == "personal_safety" then return "unsafe personal question"
-	elseif reason == "real_life_threat" or reason == "threat" then return "threatening content"
 	elseif reason == "contact_request" or reason == "meetup_request" then return "private contact or meetup request"
 	elseif reason:find("^harassment") then return "bullying or harassment"
 	elseif reason == "scam" then return "scam or fake reward"
@@ -4834,6 +4844,7 @@ local function analyseMessage(raw)
 			"touchmeprivate", "touchprivatepart",
 			-- my X better than you (sexual body part bragging)
 			"mydihbeter", "mydihbetter", "mydickbetter",
+			"submycok","submycock","submydick","submydih",
 		}
 
 		for _, p in ipairs(sexualPhrases) do
@@ -5445,9 +5456,107 @@ local function containsAcrosticInstruction(msg)
 	return hasInstruction and hasLetterTrick and hasMessageWord
 end
 
+--------------------------------------------------------------------
+-- SPACED-OUT BYPASS DETECTOR ("s e x/s e x/s/cs/ s e x", "f.u.c.k", "k i l l")
+-- Rebuilds words from consecutive short tokens and checks them against
+-- EVERY blocked list. Matches must line up with token boundaries, so normal
+-- words like "essex" or "class" are never hit.
+--------------------------------------------------------------------
+local spacedWordSet = nil
+local spacedMaxLen = 0
+
+local function buildSpacedWordSet()
+	if spacedWordSet then return end
+	spacedWordSet = {}
+
+	local function add(word, reason)
+		local w = (tostring(word):lower():gsub("[^a-z]", ""))
+		if #w >= 3 and not spacedWordSet[w] then
+			spacedWordSet[w] = reason
+			if #w > spacedMaxLen then spacedMaxLen = #w end
+		end
+	end
+
+	local function addList(list, reason)
+		if type(list) ~= "table" then return end
+		for k, v in pairs(list) do
+			if type(k) == "number" then add(v, reason) else add(k, reason) end
+		end
+	end
+
+	-- order matters: first reason wins
+	addList(SEXUAL_ROOTS, "sexual_content")
+	addList(HARD_SEXUAL_WORDS, "sexual_content")
+	addList(ANATOMY_STANDALONE, "sexual_content")
+	addList(SELF_HARM, "self_harm")
+	addList(HARD_BLOCK_EXTREMIST_TERMS, "extremism")
+	addList(HARD_BLOCK_EXTREMIST_EXACT, "extremism")
+	addList(EXTREMIST_NAMES, "extremism")
+	addList(EXTREMIST_PEOPLE_STRICT, "extremism")
+	addList(EXTREMIST_ORGS_STRICT, "extremism")
+	addList(EXTREMIST_SLOGANS_STRICT, "extremism")
+	addList(EXTREMIST_CALLS, "extremism")
+	addList(EXTREME, "extreme")
+	addList(EXPLICIT_SLURS, "profanity")
+	addList(PROFANITY, "profanity")
+	addList(FOREIGN_PROFANITY, "profanity")
+	addList(LATIN_FOREIGN_PROFANITY, "profanity")
+	addList(BLOCKED_STANDALONE_WORDS, "profanity")
+	addList(HARASSMENT, "harassment")
+	addList(SCAM_PATTERNS, "scam")
+	addList(ROBUX_VARIANTS, "scam")
+	addList(CONTACT_PHRASES, "contact_platform")
+	addList(OFF_PLATFORM_KEYS, "contact_platform")
+end
+
+local function checkSpacedOutWords(raw)
+	buildSpacedWordSet()
+
+	local s = tostring(raw or ""):lower()
+	s = s:gsub("|", "i"):gsub("!", "i"):gsub("@", "a"):gsub("%$", "s")
+		:gsub("0", "o"):gsub("1", "i"):gsub("3", "e"):gsub("4", "a")
+		:gsub("5", "s"):gsub("7", "t")
+
+	-- any separator (space, / . - _ , etc.) splits tokens
+	local tokens = {}
+	for t in s:gmatch("%a+") do
+		tokens[#tokens + 1] = t
+	end
+
+	for i = 1, #tokens do
+		local concat = ""
+		for j = i, #tokens do
+			local tok = tokens[j]
+			if #tok > 3 then break end          -- only glue together short fragments
+			concat = concat .. tok
+			if #concat > spacedMaxLen then break end
+
+			if j > i then
+				local reason = spacedWordSet[concat] or spacedWordSet[collapseRuns(concat)]
+				if reason then
+					local count = j - i + 1
+					local hasSingle = false
+					for k = i, j do
+						if #tokens[k] == 1 then hasSingle = true break end
+					end
+					-- needs a 1-letter piece or 3+ pieces, so normal short words don't trigger
+					if hasSingle or count >= 3 then
+						return true, reason
+					end
+				end
+			end
+		end
+	end
+
+	return false, nil
+end
+
 local function shouldBlock(sender, rawMessage)
 	local imgBlocked, imgReason = checkImageCases(rawMessage)
 	if imgBlocked then return true, imgReason end
+	-- NEW: spaced-out / separator bypass for ALL blocked lists
+	local spacedBlocked, spacedReason = checkSpacedOutWords(rawMessage)
+	if spacedBlocked then return true, spacedReason end
 	local nigBlocked, nigReason = checkNigerianInsult(rawMessage)
 	if nigBlocked then return true, nigReason end
 	local locBlocked, locReason = checkLocationSharing(rawMessage)
